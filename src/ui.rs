@@ -465,3 +465,51 @@ fn truncate(s: &str, max: usize) -> String {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::test_helpers::mock_agent;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn buf_lines(term: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        let (w, h) = (buf.area.width, buf.area.height);
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn draw_main_80x24_renders_header_sidebar_and_footer() {
+        let agents = vec![
+            mock_agent(Provider::Claude, "alpha"),
+            mock_agent(Provider::Codex, "bravo"),
+        ];
+        let model = build_rows(&agents);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+        term.draw(|f| draw_main(f, &agents, &model, 0, Focus::Deck, " footer ", None))
+            .expect("draw");
+
+        let lines = buf_lines(&term);
+        assert_eq!(lines.len(), 24);
+        assert!(
+            lines[0].contains("agentdeck")
+                && lines[0].contains("focus: deck")
+                && lines[0].contains("[2 agents]"),
+            "header row: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("agents"),
+            "sidebar title row: {:?}",
+            lines[1]
+        );
+        let body = lines[2..23].join("\n");
+        for needle in ["claude", "codex", "alpha", "bravo"] {
+            assert!(body.contains(needle), "sidebar missing {needle:?}");
+        }
+        assert!(lines[23].contains("footer"), "footer row: {:?}", lines[23]);
+    }
+}
