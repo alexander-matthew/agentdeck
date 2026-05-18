@@ -148,4 +148,4 @@ Early. Works for the happy path on Linux. Not yet tested on macOS (the PTY layer
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+MIT — see [LICENSE](LICENSE).
