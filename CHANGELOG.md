@@ -9,6 +9,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 - Initial documentation set: `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`, `docs/configuration.md`, `docs/providers.md`, `docs/architecture.md`, PR template.
 
+### Changed
+- License simplified from `MIT OR Apache-2.0` dual to MIT-only. The repo had no external contributions yet, so no relicensing of third-party work was needed.
+
 ## [0.1.0] — 2026-05-17
 
 ### Added
