@@ -541,13 +541,13 @@ impl App {
                 }
             }
             Event::Mouse(m) => match m.kind {
-                MouseEventKind::Down(event::MouseButton::Left) => {
-                    if m.column < SIDEBAR_WIDTH && m.row >= 2 {
-                        let row_idx = (m.row - 2) as usize;
-                        if let Some(pos) = model.selectable.iter().position(|&r| r == row_idx) {
-                            self.selected = pos;
-                            self.focus = Focus::Agent;
-                        }
+                MouseEventKind::Down(event::MouseButton::Left)
+                    if m.column < SIDEBAR_WIDTH && m.row >= 2 =>
+                {
+                    let row_idx = (m.row - 2) as usize;
+                    if let Some(pos) = model.selectable.iter().position(|&r| r == row_idx) {
+                        self.selected = pos;
+                        self.focus = Focus::Agent;
                     }
                 }
                 MouseEventKind::ScrollUp => {
