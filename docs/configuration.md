@@ -38,10 +38,10 @@ command   = "claude"
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `prefix_byte` | integer (0–127) | `1` (Ctrl-A) | Control-byte that starts the detach chord. Use `2` for Ctrl-B (tmux-style), `28` for Ctrl-\\, etc. Pick something you don't normally use inside an agent's TUI. |
-| `detach_key` | string (one char) | `"d"` | Key that triggers detach when typed after the prefix. |
+| `prefix_byte` | integer | `1` | **Deprecated, no-op.** Was the detach-chord prefix back when "attach" was a separate mode. The current model is split-view with `F1` as the only intercepted key, so this field is accepted-but-ignored. Safe to leave in old configs. |
+| `detach_key` | string | `"d"` | **Deprecated, no-op.** Same story. |
 
-The "double-tap" escape rule applies: typing the prefix twice in a row sends a literal prefix byte through to the agent, so e.g. setting `prefix_byte = 1` and then needing to send Ctrl-A to the agent still works — just press it twice.
+The detach chord behaviour these used to control is no longer reachable: the deck is always visible and `F1` swaps focus between agent and deck instead.
 
 ## `[[agent]]`
 

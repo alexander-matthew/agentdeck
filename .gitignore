@@ -1,3 +1,8 @@
 /target
 Cargo.lock.bak
 *.log
+
+# A stray /agents directory has shown up here from an unrelated project.
+# We ignore the whole tree so it can't be accidentally committed; the actual
+# home for that content is elsewhere (the personal-site agent-loop repo).
+/agents/

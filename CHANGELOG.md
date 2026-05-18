@@ -8,16 +8,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 - Initial documentation set: `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`, `docs/configuration.md`, `docs/providers.md`, `docs/architecture.md`, PR template.
-- Provider-grouped overview list with non-selectable section headings (`claude`, `codex`, `gemini`, `other`). Navigation skips headings; number-key bindings index selectable rows top-to-bottom.
-- Live status badges per agent: `starting`, `working`, `thinking`, `idle`, `waiting`, `stuck`, `exited`. Combines activity timestamps with provider-specific terminal-output heuristics (`src/state.rs`).
-- Runtime add (`a` or `+`) and remove (`x`) of agents. `a` opens a small modal prefilled with the highlighted agent's cwd; `Enter` spawns. Ephemeral — not persisted to config.
+- Provider-grouped overview list with non-selectable section headings. Navigation skips headings; number-key bindings index selectable rows top-to-bottom.
+- Live status badges per agent (`starting` / `working` / `thinking` / `idle` / `waiting` / `stuck` / `exited`). Combines activity timestamps with provider-specific terminal-output heuristics (`src/state.rs`).
+- Runtime add (`a` or `+`) and remove (`x`) of agents via in-TUI modal. Ephemeral — not persisted to config.
 - Stable per-process `RuntimeId` for agent event routing, so events survive list mutation.
-- README install section now documents `cargo install --path .` ergonomics and PATH setup.
+- **Persistent split view**: sidebar (deck) and focused-agent pane are visible simultaneously. The agent's terminal grid is rendered through agentdeck's own UI (vt100 → ratatui with cell-level fg/bg/bold/italic/underline/inverse styling), with the agent's cursor positioned via ratatui's `set_cursor_position`.
+- **`F1`** is the single global key reserved by agentdeck — toggles focus between deck and agent. None of the supported agent CLIs bind F1.
+- `src/keymap.rs` serializes crossterm `KeyEvent`s back to PTY-bound byte sequences (chars, Alt-prefixed chars, every Ctrl-letter, arrows with modifiers, F2–F12, navigation cluster).
+- README install section documents `cargo install --path .` ergonomics and PATH setup.
 
 ### Changed
-- License simplified from `MIT OR Apache-2.0` dual to MIT-only. The repo had no external contributions yet, so no relicensing of third-party work was needed.
-- `AgentEvent` carries `rid: RuntimeId` instead of `agent_idx: usize` — breaking change for any out-of-tree consumers (there are none).
-- Agent list pane widened to 42 cols to fit status badges.
+- License simplified from `MIT OR Apache-2.0` dual to MIT-only.
+- `AgentEvent` carries `rid: RuntimeId` instead of `agent_idx: usize`.
+- **Replaced the modal attach model with persistent split view.** Pressing Enter / digit on the deck no longer hands the terminal to the agent full-screen; instead it returns focus to that agent inside the existing split. There is no more "detach back to the deck" — the deck never goes away.
+- `[settings] prefix_byte` / `detach_key` are accepted-but-ignored. Their old purpose (the detach chord) is gone.
+
+### Removed
+- Raw-stdin reader thread and the LeaveAlternateScreen/EnterAlternateScreen handoff dance. ratatui now owns the screen for the whole session.
+- `Agent::current_screen_bytes()` (was used by the old attach-snapshot path).
 
 ## [0.1.0] — 2026-05-17
 

@@ -193,10 +193,4 @@ impl Agent {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
-
-    pub fn current_screen_bytes(&self) -> Vec<u8> {
-        // Bytes that, when written to a terminal, recreate the current screen state.
-        // Used at attach-time to paint the agent's current frame onto our real terminal.
-        self.parser.screen().contents_formatted()
-    }
 }
