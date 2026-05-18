@@ -3,16 +3,19 @@
 A small Rust TUI for managing several AI-agent CLIs (Claude Code, Codex CLI, Gemini CLI, …) at once — like a "control room" with a 1000-foot overview and the ability to dive into any agent's native session.
 
 ```
-┌─ agents ────────────────────────┐ ┌─ preview · Claude · running ──────────┐
-│  1 ● Claude         claude      │ │ > write me a small fn that…           │
-│ ▶2 ● Codex          codex       │ │ Sure — here's a sketch:               │
-│  3 ● Gemini         gemini      │ │   fn solve(x: i32) -> i32 {           │
-│  4 ○ exploration    claude      │ │       …                               │
-└─────────────────────────────────┘ └───────────────────────────────────────┘
- ↑/↓ select   1-9 attach   r restart   k kill   q quit
+┌─ agents ──────────────────────────────┐ ┌─ preview · Claude · waiting ──────────┐
+│  claude (2)                            │ │ > write me a small fn that…           │
+│  1 ● Claude               waiting      │ │ Sure — here's a sketch:               │
+│ ▶2 ● Claude · agentdeck   working      │ │   fn solve(x: i32) -> i32 {           │
+│  codex (1)                             │ │       …                               │
+│  3 ● Codex                thinking     │ │                                       │
+│  gemini (1)                            │ │                                       │
+│  4 ● Gemini               idle         │ │                                       │
+└────────────────────────────────────────┘ └───────────────────────────────────────┘
+ ↑/↓ select   1-9 attach   a add   x remove   q quit
 ```
 
-Press `Enter` (or a number) to take over the real terminal with that agent's full native TUI. Press `Ctrl-A d` to come back to the overview.
+Each agent runs in its own PTY. Press `Enter` (or a number) to take over the real terminal with the agent's full native TUI. Press `Ctrl-A d` to come back to the overview. Press `a` to spawn another agent under the same provider; `x` to remove one.
 
 ## Why this exists
 
@@ -35,7 +38,7 @@ This also means agentdeck has near-zero auth surface area of its own.
 
 ## Install
 
-Requires Rust 1.85+ (the binary builds clean on 1.93). On Ubuntu 24.04+:
+Requires Rust 1.85+ (builds clean on 1.93). On Ubuntu 24.04+:
 
 ```sh
 sudo apt install -y rustc cargo
@@ -49,7 +52,16 @@ git clone https://github.com/alexander-matthew/agentdeck && cd agentdeck
 cargo install --path .
 ```
 
-`agentdeck` ends up in `~/.cargo/bin/` (or wherever your `CARGO_HOME/bin` is). Make sure that's on `PATH`.
+The binary lands at `~/.cargo/bin/agentdeck`. If that's not on your `PATH`, add it:
+
+```sh
+# bash: in ~/.profile (login shells) or ~/.bashrc (interactive shells)
+if [ -d "$HOME/.cargo/bin" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+fi
+```
+
+After that, `agentdeck` is just one word, the same as `claude` or `codex`.
 
 ## First run
 
@@ -105,11 +117,21 @@ You can run **multiple instances of the same provider** by giving each its own `
 ### Overview
 | Key | Action |
 | --- | --- |
-| `↑` / `k`, `↓` / `j` | move cursor |
-| `1`–`9` | attach to that agent |
+| `↑` / `k`, `↓` / `j` | move cursor (skips provider headings) |
+| `1`–`9` | attach to that agent (numbered top-to-bottom across providers) |
 | `Enter` | attach to highlighted agent |
-| `Shift-K` | kill highlighted agent (SIGKILL) |
+| `a` or `+` | spawn another agent under the highlighted agent's provider, prompting for cwd (ephemeral — not persisted to config) |
+| `x` | kill and remove the highlighted agent |
 | `q`, `Ctrl-C` | quit (kills all child agents) |
+
+### Adding (cwd prompt)
+| Key | Action |
+| --- | --- |
+| typing | edit the cwd |
+| `←` / `→`, `Home` / `End` | move cursor in the field |
+| `Backspace` | delete char left of cursor |
+| `Enter` | spawn the new agent with this cwd |
+| `Esc` or `Ctrl-C` | cancel |
 
 ### Attached
 The agent's full native TUI controls the terminal. The only intercepted chord is:
@@ -119,6 +141,22 @@ The agent's full native TUI controls the terminal. The only intercepted chord is
 | `Ctrl-A Ctrl-A` | send a literal `Ctrl-A` through to the agent |
 
 Change the prefix via `settings.prefix_byte` in the config.
+
+## Status badges
+
+agentdeck inspects each agent's terminal output and labels its current state. The badge color and word change as the agent moves between phases:
+
+| Badge | Meaning |
+| --- | --- |
+| `starting` (cyan) | spawned in the last ~1s; first frame hasn't drawn yet |
+| `working` (yellow) | bytes streaming right now — tokens, tool output, etc |
+| `thinking` (magenta) | spinner glyphs detected in the bottom portion of the screen |
+| `idle` (gray) | nothing happening but recently was, no detected prompt |
+| `waiting` (bold green) | provider-specific prompt visible — **your turn** |
+| `stuck` (bold red) | 45+ seconds of silence and the screen doesn't look like a prompt |
+| `exited` (gray / red) | process exited; red if non-zero exit code |
+
+Detection uses small provider-specific patterns (see `src/state.rs`). When a CLI redesigns its UI, that's the file to update.
 
 ## Design notes
 

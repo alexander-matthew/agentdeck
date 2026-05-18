@@ -16,6 +16,8 @@ If the file doesn't exist on first run, agentdeck writes a default with profiles
 agentdeck --print-config
 ```
 
+Agents added at runtime via the `a` key are **not** written back to the config — they only live until you quit. To make a new agent permanent, edit `config.toml` and relaunch.
+
 ## File structure
 
 The file has one optional `[settings]` table and any number of `[[agent]]` array-of-table entries:

@@ -52,9 +52,10 @@ The whole orchestration is **single-threaded** at the decision-making level. Thr
 | --- | --- |
 | `src/main.rs` | CLI parsing (`clap`), tracing setup, config resolution, dispatch to `app::run`. |
 | `src/config.rs` | `Config`, `Settings`, `AgentConfig`, `Provider`. Load-or-init logic, path expansion. |
-| `src/agent.rs` | `Agent` struct, PTY spawn, reader thread, vt100 parser, status polling. |
-| `src/ui.rs` | Ratatui overview rendering (header, agent list, preview pane). Attached mode does NOT render here — it writes bytes straight to stdout. |
-| `src/app.rs` | The event loop, the mode state machine, attach/detach orchestration, stdin reader thread for attached mode. |
+| `src/agent.rs` | `Agent` struct, PTY spawn, reader thread, vt100 parser, activity timestamps, exit polling. |
+| `src/state.rs` | `LiveState` enum and `detect()` function: combines activity windows with provider-specific terminal-output heuristics to label what an agent is doing. |
+| `src/ui.rs` | Ratatui overview rendering (header, grouped agent list, preview pane, add-agent modal). Attached mode does NOT render here — it writes bytes straight to stdout. |
+| `src/app.rs` | The event loop, the mode state machine (`Overview` / `Attached` / `Adding`), attach/detach orchestration, stdin reader thread for attached mode, stable-id routing. |
 
 ## Data flow
 
@@ -146,6 +147,21 @@ You might wonder why we maintain a `vt100::Parser` per agent if attached mode ju
 
 1. **Preview pane.** We need a structured view of the agent's screen to render the right side of the overview. Without a parser, we'd be showing a stream of raw bytes including ANSI escapes — unreadable.
 2. **Attach snapshot.** When you press Enter, the agent doesn't know to redraw. The parser has been keeping up the whole time, so we can emit `screen().contents_formatted()` to repaint the current state without involving the child process at all.
+
+## Live-state detection
+
+`src/state.rs` produces a `LiveState` per agent each frame. The signal hierarchy:
+
+1. **Process exited?** → `Exited(code)`.
+2. **Spawned <800ms ago?** → `Starting` (the CLI may not have drawn its first frame).
+3. **Recent activity** (bytes in the last 500ms): we either return `Working`, or — if the bottom third of the screen contains a known spinner glyph (`⠋⠙⠹…`, `◐◓◑◒`) — `Thinking`. Spinners produce lots of small redraws that aren't meaningful content change, and we don't want that to look like "the model is generating".
+4. **Quiet ≥ 4s** and provider-specific awaiting-input pattern matched → `Waiting`. The pattern check lives in `provider_awaiting_input()` and is the one place that knows about Claude Code's `│ >` input frame, Codex's `▌` cursor, Gemini's `> ` line, etc.
+5. **Quiet ≥ 45s** with no prompt match → `Stuck`.
+6. Otherwise → `Idle`.
+
+These thresholds are tuned for "user can read the badge change as it happens" rather than instant reaction; bumping them too low makes badges flicker between Working and Idle mid-stream. Source: `state.rs:50`.
+
+When upstream CLIs redesign their UI, the provider-specific helper for that CLI is the only place that needs updating. Falling back to the `Idle` badge if a heuristic stops matching is intentional — better a vague but truthful badge than a confidently wrong one.
 
 ## Resize handling
 
