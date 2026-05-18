@@ -1,0 +1,30 @@
+[package]
+name = "agentdeck"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal control room for managing multiple AI agent CLIs (Claude, Codex, Gemini) across providers."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alexander-matthew/agentdeck"
+readme = "README.md"
+keywords = ["tui", "agent", "claude", "codex", "gemini"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+portable-pty = "0.8"
+vt100 = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+shellexpand = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
