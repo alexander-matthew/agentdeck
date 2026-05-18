@@ -243,31 +243,16 @@ impl App {
     }
 
     fn handle_action(&mut self, action: Action, model: &ui::RowModel) -> Result<()> {
+        if apply_nav_action(
+            action,
+            &mut self.selected,
+            &mut self.focus,
+            &mut self.should_quit,
+            model,
+        ) {
+            return Ok(());
+        }
         match action {
-            Action::Quit => self.should_quit = true,
-            Action::MoveUp => {
-                let n = model.selectable.len();
-                if n > 0 {
-                    self.selected = if self.selected == 0 { n - 1 } else { self.selected - 1 };
-                }
-            }
-            Action::MoveDown => {
-                let n = model.selectable.len();
-                if n > 0 {
-                    self.selected = (self.selected + 1) % n;
-                }
-            }
-            Action::FocusAgent => {
-                if self.agent_idx_at_selected(model).is_some() {
-                    self.focus = Focus::Agent;
-                }
-            }
-            Action::FocusIndex(i) => {
-                if i < model.selectable.len() {
-                    self.selected = i;
-                    self.focus = Focus::Agent;
-                }
-            }
             Action::AddAgent => {
                 if let Some(ai) = self.agent_idx_at_selected(model) {
                     let a = &self.agents[ai];
@@ -287,25 +272,15 @@ impl App {
                     self.agents.remove(ai);
                 }
             }
-            Action::ToggleFocus => {
-                self.focus = match self.focus {
-                    Focus::Deck => Focus::Agent,
-                    Focus::Agent => Focus::Deck,
-                };
-            }
-            Action::None => {}
+            // Nav actions (Quit/MoveUp/MoveDown/FocusAgent/FocusIndex/ToggleFocus/None)
+            // are already handled above via `apply_nav_action`.
+            _ => {}
         }
         Ok(())
     }
 
     fn agent_idx_at_selected(&self, model: &ui::RowModel) -> Option<usize> {
-        model.selectable.get(self.selected).and_then(|&row_idx| {
-            if let Some(ui::Row::Agent(ai)) = model.rows.get(row_idx) {
-                Some(*ai)
-            } else {
-                None
-            }
-        })
+        agent_idx_at(self.selected, model)
     }
 
     fn spawn_runtime_agent(&mut self, provider: Provider, cwd: &str) {
@@ -330,12 +305,11 @@ impl App {
     }
 
     fn forward_to_agent(&mut self, k: KeyEvent, model: &ui::RowModel) {
-        if let Some(ai) = self.agent_idx_at_selected(model) {
-            if let Some(a) = self.agents.get_mut(ai) {
-                if let Some(bytes) = keymap::key_event_to_bytes(&k) {
-                    let _ = a.write(&bytes);
-                }
-            }
+        if let Some(ai) = self.agent_idx_at_selected(model)
+            && let Some(a) = self.agents.get_mut(ai)
+            && let Some(bytes) = keymap::key_event_to_bytes(&k)
+        {
+            let _ = a.write(&bytes);
         }
     }
 }
@@ -442,6 +416,62 @@ fn provider_display(p: Provider) -> &'static str {
     }
 }
 
+/// Apply nav-only actions (no agent list mutation) to the deck state.
+/// Returns true if the action was handled here; false if it needs the full
+/// `App` context (currently `AddAgent` / `RemoveAgent`).
+fn apply_nav_action(
+    action: Action,
+    selected: &mut usize,
+    focus: &mut Focus,
+    should_quit: &mut bool,
+    model: &ui::RowModel,
+) -> bool {
+    let n = model.selectable.len();
+    match action {
+        Action::Quit => *should_quit = true,
+        Action::MoveUp => {
+            if n > 0 {
+                *selected = if *selected == 0 { n - 1 } else { *selected - 1 };
+            }
+        }
+        Action::MoveDown => {
+            if n > 0 {
+                *selected = (*selected + 1) % n;
+            }
+        }
+        Action::FocusAgent => {
+            if agent_idx_at(*selected, model).is_some() {
+                *focus = Focus::Agent;
+            }
+        }
+        Action::FocusIndex(i) => {
+            if i < n {
+                *selected = i;
+                *focus = Focus::Agent;
+            }
+        }
+        Action::ToggleFocus => {
+            *focus = match *focus {
+                Focus::Deck => Focus::Agent,
+                Focus::Agent => Focus::Deck,
+            };
+        }
+        Action::None => {}
+        Action::AddAgent | Action::RemoveAgent => return false,
+    }
+    true
+}
+
+fn agent_idx_at(selected: usize, model: &ui::RowModel) -> Option<usize> {
+    model.selectable.get(selected).and_then(|&row_idx| {
+        if let Some(ui::Row::Agent(ai)) = model.rows.get(row_idx) {
+            Some(*ai)
+        } else {
+            None
+        }
+    })
+}
+
 fn short_cwd(cwd: &str) -> String {
     let home = std::env::var("HOME").ok();
     let collapsed = match home {
@@ -453,4 +483,79 @@ fn short_cwd(cwd: &str) -> String {
         return collapsed;
     }
     parts[parts.len() - 1].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keymap::map_deck_key;
+    use crate::ui::Row;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Build a synthetic `RowModel` with `n` agent rows. Bypasses `Agent` entirely
+    /// so the deck state machine can be exercised without spawning PTYs.
+    fn fake_model(n: usize) -> ui::RowModel {
+        let rows: Vec<Row> = (0..n).map(Row::Agent).collect();
+        let selectable: Vec<usize> = (0..n).collect();
+        ui::RowModel { rows, selectable }
+    }
+
+    fn apply(
+        code: KeyCode,
+        mods: KeyModifiers,
+        st: &mut (usize, Focus, bool),
+        model: &ui::RowModel,
+    ) {
+        let ev = KeyEvent::new(code, mods);
+        apply_nav_action(map_deck_key(ev), &mut st.0, &mut st.1, &mut st.2, model);
+    }
+
+    #[test]
+    fn pressing_q_sets_should_quit() {
+        let model = fake_model(1);
+        let mut st = (0, Focus::Deck, false);
+        apply(KeyCode::Char('q'), KeyModifiers::NONE, &mut st, &model);
+        assert!(st.2);
+        // Ctrl-C is the alternate quit binding.
+        let mut st2 = (0, Focus::Deck, false);
+        apply(KeyCode::Char('c'), KeyModifiers::CONTROL, &mut st2, &model);
+        assert!(st2.2);
+    }
+
+    #[test]
+    fn pressing_digit_focuses_agent_at_index() {
+        let model = fake_model(3);
+        let mut st = (0, Focus::Deck, false);
+        apply(KeyCode::Char('2'), KeyModifiers::NONE, &mut st, &model);
+        assert_eq!(st.0, 1, "'2' selects the second selectable row");
+        assert_eq!(st.1, Focus::Agent, "digit jumps focus to the agent pane");
+    }
+
+    #[test]
+    fn arrow_down_advances_then_wraps() {
+        let model = fake_model(2);
+        let mut st = (0, Focus::Deck, false);
+        apply(KeyCode::Down, KeyModifiers::NONE, &mut st, &model);
+        assert_eq!(st.0, 1);
+        apply(KeyCode::Down, KeyModifiers::NONE, &mut st, &model);
+        assert_eq!(st.0, 0, "down past last entry wraps to first");
+    }
+
+    #[test]
+    fn arrow_up_at_zero_wraps_to_last() {
+        let model = fake_model(2);
+        let mut st = (0, Focus::Deck, false);
+        apply(KeyCode::Up, KeyModifiers::NONE, &mut st, &model);
+        assert_eq!(st.0, 1);
+    }
+
+    #[test]
+    fn f1_toggles_focus() {
+        let model = fake_model(1);
+        let mut st = (0, Focus::Deck, false);
+        apply(KeyCode::F(1), KeyModifiers::NONE, &mut st, &model);
+        assert_eq!(st.1, Focus::Agent);
+        apply(KeyCode::F(1), KeyModifiers::NONE, &mut st, &model);
+        assert_eq!(st.1, Focus::Deck);
+    }
 }

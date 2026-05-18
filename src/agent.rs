@@ -194,3 +194,112 @@ impl Agent {
         let _ = self.child.kill();
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use super::*;
+    use crate::config::AgentConfig;
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    /// Build an `Agent` instance whose PTY is fully mocked. Suitable for state
+    /// machine and rendering tests that never need to read or write the child.
+    pub fn mock_agent(provider: Provider, name: &str) -> Agent {
+        let cfg = AgentConfig {
+            id: name.to_string(),
+            name: Some(name.to_string()),
+            provider,
+            command: "true".into(),
+            args: vec![],
+            cwd: None,
+            env: BTreeMap::new(),
+            manual: false,
+        };
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let now = Instant::now();
+        // Subtract a comfortable margin so detectors past STARTUP_GRACE behave deterministically.
+        let past = now - Duration::from_secs(10);
+        Agent {
+            rid: 1,
+            name: name.to_string(),
+            provider,
+            status: Status::Running,
+            parser: vt100::Parser::new(size.rows, size.cols, 1000),
+            template: cfg,
+            cwd_label: None,
+            spawned_at: past,
+            last_output_at: past,
+            recent_bytes: 0,
+            recent_window_start: past,
+            master: Box::new(MockMaster),
+            writer: Box::new(Vec::new()),
+            child: Box::new(MockChild),
+            size,
+        }
+    }
+
+    pub struct MockMaster;
+    impl portable_pty::MasterPty for MockMaster {
+        fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+            Ok(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+        fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn process_group_leader(&self) -> Option<i32> {
+            None
+        }
+        fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct MockChild;
+    impl portable_pty::ChildKiller for MockChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(MockKiller)
+        }
+    }
+    impl portable_pty::Child for MockChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct MockKiller;
+    impl portable_pty::ChildKiller for MockKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(MockKiller)
+        }
+    }
+}

@@ -377,11 +377,11 @@ mod tests {
         let (rows, _cols) = agent.parser.screen().size();
         let prompt = "\x1b[H\x1b[J"; // Clear
         agent.feed(prompt.as_bytes());
-        
+
         // Move to bottom area and draw claude prompt
         let bytes = format!("\x1b[{};1H│ > hello", rows - 1);
         agent.feed(bytes.as_bytes());
-        
+
         // Advance time to pass ACTIVE_WINDOW but stay within IDLE_DEADLINE for Waiting check
         agent.last_output_at = Instant::now() - Duration::from_secs(5);
         assert_eq!(detect(&agent), LiveState::Waiting);
@@ -393,7 +393,7 @@ mod tests {
         let (rows, _cols) = agent.parser.screen().size();
         let bytes = format!("\x1b[{};1H> ", rows - 1);
         agent.feed(bytes.as_bytes());
-        
+
         agent.last_output_at = Instant::now() - Duration::from_secs(5);
         assert_eq!(detect(&agent), LiveState::Waiting);
     }
@@ -405,4 +405,3 @@ mod tests {
         assert_eq!(detect(&agent), LiveState::Stuck);
     }
 }
-

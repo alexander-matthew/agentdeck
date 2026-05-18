@@ -33,19 +33,19 @@ pub fn map_deck_key(ev: KeyEvent) -> Action {
     match ev.code {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('c') if ev.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
-        
+
         KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
         KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
-        
+
         KeyCode::Enter => Action::FocusAgent,
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
             let i = (c as u8 - b'1') as usize;
             Action::FocusIndex(i)
         }
-        
+
         KeyCode::Char('a') | KeyCode::Char('+') => Action::AddAgent,
         KeyCode::Char('x') => Action::RemoveAgent,
-        
+
         _ => Action::None,
     }
 }
