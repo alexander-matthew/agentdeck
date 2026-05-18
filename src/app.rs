@@ -365,24 +365,14 @@ fn handle_adding_event(ev: Event, cwd: &mut String, cursor: &mut usize) -> Addin
                 cwd.insert(idx, c);
                 *cursor += 1;
             }
-            KeyCode::Backspace => {
-                if *cursor > 0 {
-                    let end = byte_index_for_char_cursor(cwd, *cursor);
-                    let start = byte_index_for_char_cursor(cwd, *cursor - 1);
-                    cwd.drain(start..end);
-                    *cursor -= 1;
-                }
+            KeyCode::Backspace if *cursor > 0 => {
+                let end = byte_index_for_char_cursor(cwd, *cursor);
+                let start = byte_index_for_char_cursor(cwd, *cursor - 1);
+                cwd.drain(start..end);
+                *cursor -= 1;
             }
-            KeyCode::Left => {
-                if *cursor > 0 {
-                    *cursor -= 1;
-                }
-            }
-            KeyCode::Right => {
-                if *cursor < cwd.chars().count() {
-                    *cursor += 1;
-                }
-            }
+            KeyCode::Left if *cursor > 0 => *cursor -= 1,
+            KeyCode::Right if *cursor < cwd.chars().count() => *cursor += 1,
             KeyCode::Home => *cursor = 0,
             KeyCode::End => *cursor = cwd.chars().count(),
             _ => {}
