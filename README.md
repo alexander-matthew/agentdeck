@@ -1,29 +1,32 @@
 # agentdeck
 
-A small Rust TUI for managing several AI-agent CLIs (Claude Code, Codex CLI, Gemini CLI, …) at once — like a "control room" with a 1000-foot overview and the ability to dive into any agent's native session.
+A small Rust TUI that wraps multiple AI-agent CLIs (Claude Code, Codex CLI, Gemini CLI, …) in a single split-pane view. The deck on the left is always visible; the focused agent fills the rest of the screen and you type into it the same way you'd type into the CLI on its own.
 
 ```
-┌─ agents ──────────────────────────────┐ ┌─ preview · Claude · waiting ──────────┐
-│  claude (2)                            │ │ > write me a small fn that…           │
-│  1 ● Claude               waiting      │ │ Sure — here's a sketch:               │
-│ ▶2 ● Claude · agentdeck   working      │ │   fn solve(x: i32) -> i32 {           │
-│  codex (1)                             │ │       …                               │
-│  3 ● Codex                thinking     │ │                                       │
-│  gemini (1)                            │ │                                       │
-│  4 ● Gemini               idle         │ │                                       │
-└────────────────────────────────────────┘ └───────────────────────────────────────┘
- ↑/↓ select   1-9 attach   a add   x remove   q quit
+ agentdeck   focus: agent   [4 agents]    F1 to toggle focus
+┌─ agents ─────────────────────────┐┌─ Claude · running · waiting ─────────┐
+│ claude (2)                        ││ > write me a small fn that…          │
+│  1 ● Claude              waiting  ││ Sure — here's a sketch:              │
+│ ▶2 ● Claude · agentdeck  working  ││   fn solve(x: i32) -> i32 {          │
+│ codex (1)                         ││       …                              │
+│  3 ● Codex               thinking ││                                      │
+│ gemini (1)                        ││                                      │
+│  4 ● Gemini              idle     ││                                      │
+└───────────────────────────────────┘└──────────────────────────────────────┘
+ typing → focused agent   F1 → deck   Ctrl-C → interrupt agent
 ```
 
-Each agent runs in its own PTY. Press `Enter` (or a number) to take over the real terminal with the agent's full native TUI. Press `Ctrl-A d` to come back to the overview. Press `a` to spawn another agent under the same provider; `x` to remove one.
+Default focus is the agent — every keystroke goes straight to it, including `Enter`, arrows, `Ctrl-C`, `Tab`, etc. The one key agentdeck reserves for itself is **F1**, which toggles focus between the agent and the deck. None of the supported agent CLIs bind F1, so this is the safest "always free" key.
+
+When the deck has focus you can navigate with `↑/↓`, jump with `1`–`9`, spawn another agent under the highlighted provider with `a`, kill one with `x`, and quit with `q`. `Enter` (or any digit) returns focus to that agent.
 
 ## Why this exists
 
 The agent CLIs (`claude`, `codex`, `gemini`) are full-screen TUIs in their own right, and running more than one at a time means juggling terminal tabs, tmux windows, or hoping you remember which agent is in which pane. agentdeck gives you a single entrypoint that:
 
 - spawns each agent in its own PTY,
-- shows them all in a status list with a live preview pane,
-- lets you "attach" to any one of them as if you'd opened it yourself,
+- shows them all together in a sidebar with live status badges,
+- lets you type into any one of them as the focused pane,
 - and keeps each agent's chat context completely isolated from the others — no cross-contamination, no shared transcript, no extra tokens spent on orchestration.
 
 ## How it talks to providers
@@ -114,17 +117,31 @@ You can run **multiple instances of the same provider** by giving each its own `
 
 ## Keys
 
-### Overview
+The only key agentdeck reserves globally is **F1**, which swaps focus between the agent pane and the deck sidebar. Everything else depends on which pane has focus.
+
+### Focus = agent (default)
+
+All keystrokes are forwarded to the focused agent's PTY (chars, arrows, F2–F12, Ctrl-X letters, Backspace, Tab, Enter, Esc, Home/End/PgUp/PgDn/Del/Ins). Just type into Claude / Codex / Gemini the way you would if you'd run it standalone.
+
+| Key | Action |
+| --- | --- |
+| anything | sent to the focused agent |
+| `F1` | swap focus to the deck |
+
+### Focus = deck
+
 | Key | Action |
 | --- | --- |
 | `↑` / `k`, `↓` / `j` | move cursor (skips provider headings) |
-| `1`–`9` | attach to that agent (numbered top-to-bottom across providers) |
-| `Enter` | attach to highlighted agent |
-| `a` or `+` | spawn another agent under the highlighted agent's provider, prompting for cwd (ephemeral — not persisted to config) |
+| `1`–`9` | jump to that agent and return focus to it |
+| `Enter` | return focus to the highlighted agent |
+| `a` or `+` | spawn another agent under the highlighted agent's provider (ephemeral cwd prompt) |
 | `x` | kill and remove the highlighted agent |
 | `q`, `Ctrl-C` | quit (kills all child agents) |
+| `F1` | swap focus back to the agent |
 
 ### Adding (cwd prompt)
+
 | Key | Action |
 | --- | --- |
 | typing | edit the cwd |
@@ -132,15 +149,6 @@ You can run **multiple instances of the same provider** by giving each its own `
 | `Backspace` | delete char left of cursor |
 | `Enter` | spawn the new agent with this cwd |
 | `Esc` or `Ctrl-C` | cancel |
-
-### Attached
-The agent's full native TUI controls the terminal. The only intercepted chord is:
-| Key | Action |
-| --- | --- |
-| `Ctrl-A d` (default) | detach back to overview |
-| `Ctrl-A Ctrl-A` | send a literal `Ctrl-A` through to the agent |
-
-Change the prefix via `settings.prefix_byte` in the config.
 
 ## Status badges
 

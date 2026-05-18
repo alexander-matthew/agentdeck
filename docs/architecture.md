@@ -1,50 +1,48 @@
 # Architecture
 
-A walkthrough of how agentdeck is put together internally. Aimed at contributors and the curious. Code references are file:line where useful.
+A walkthrough of how agentdeck is put together internally. Aimed at contributors and the curious. Code references are `file:line` where useful.
 
 ## High level
 
 ```
-                       ┌──────────────────────────────────┐
-                       │             main loop            │
-                       │  (single-threaded event pump)    │
-                       └──────────────────────────────────┘
-                          ▲   ▲                  │     │
-       agent_rx           │   │                  │     │ overview draws
-       (crossbeam,        │   │                  │     ▼
-        unbounded)        │   │              ┌───────────────┐
-                          │   │              │   ratatui     │
-                          │   │              │  CrosstermBE  │
-       ┌──────────────────┤   │              └───────────────┘
-       │                  │   │                  ▲      ▲
-  ┌────┴────┐       ┌─────┴───┐                  │      │  attached mode
-  │ reader  │  …    │ reader  │   per-agent      │      │  bypasses ratatui:
-  │ thread  │       │ thread  │   threads        │      │  raw bytes →
-  └────┬────┘       └────┬────┘                  │      │  stdout
-       │                 │                       │      │
-  ┌────▼────┐       ┌────▼────┐                  │      │
-  │ PTY     │       │ PTY     │  one PTY per     │      │
-  │ master  │       │ master  │  agent           │      │
-  └────┬────┘       └────┬────┘                  │      │
-       │                 │                       │      │
-   slave fd ─► child  slave fd ─► child          │      │
-   (claude)            (codex)                   │      │
-                                                 │      │
-              ┌──────────────────┐               │      │
-              │  stdin reader    │ ─ input_rx ──►│      │
-              │  (only while     │ (crossbeam,   │      │
-              │   attached)      │  bounded 256) │      │
-              └──────────────────┘               │      │
-                       ▲                         │      │
-                       │ raw bytes               │      │
-                  /dev/tty (stdin in raw mode)   │      │
-                                                 │      │
-              ┌──────────────────────────────────┘      │
-              │   user's real terminal                  │
-              └─────────────────────────────────────────┘
+                  ┌──────────────────────────────────┐
+                  │             main loop            │
+                  │  (single-threaded event pump)    │
+                  └──────────────────────────────────┘
+                     ▲   ▲                  │
+       agent_rx      │   │                  │  draws every ~50 ms
+       (crossbeam,   │   │                  ▼
+        unbounded)   │   │             ┌───────────────┐
+                     │   │             │   ratatui     │
+                     │   │             │  CrosstermBE  │
+       ┌─────────────┤   │             │ owns screen   │
+       │             │   │             │  end-to-end   │
+  ┌────┴────┐   ┌────┴───┐             └───────────────┘
+  │ reader  │   │ reader │   per-agent       ▲
+  │ thread  │…  │ thread │   threads         │
+  └────┬────┘   └────┬───┘                   │ key events,
+       │             │                       │ resize, mouse
+  ┌────▼────┐   ┌────▼───┐                   │
+  │ PTY     │   │ PTY    │                   │
+  │ master  │   │ master │                   │
+  └────┬────┘   └────┬───┘            ┌──────┴───────┐
+       │             │                │ crossterm    │
+   slave fd       slave fd            │ event::poll  │
+       │             │                └──────────────┘
+       ▼             ▼                       ▲
+   child           child                     │
+   (claude)        (codex)                   │
+                                             │
+                            ┌────────────────┘
+                            │  raw stdin in raw mode
+                            │  (managed by crossterm)
+                            ▼
+                       real terminal
 ```
 
-The whole orchestration is **single-threaded** at the decision-making level. Threads are only used to convert blocking I/O (PTY reads, stdin reads while attached) into channel messages.
+The whole orchestration is **single-threaded** at the decision-making level. The only threads are per-agent PTY readers — they convert blocking `read()` on each master fd into `AgentEvent::Output { rid, bytes }` messages that the main loop drains every tick.
+
+There is no separate stdin reader thread anymore. The main loop pulls everything through `crossterm::event::poll`, including the bytes we forward to the focused agent.
 
 ## Module map
 
@@ -54,121 +52,95 @@ The whole orchestration is **single-threaded** at the decision-making level. Thr
 | `src/config.rs` | `Config`, `Settings`, `AgentConfig`, `Provider`. Load-or-init logic, path expansion. |
 | `src/agent.rs` | `Agent` struct, PTY spawn, reader thread, vt100 parser, activity timestamps, exit polling. |
 | `src/state.rs` | `LiveState` enum and `detect()` function: combines activity windows with provider-specific terminal-output heuristics to label what an agent is doing. |
-| `src/ui.rs` | Ratatui overview rendering (header, grouped agent list, preview pane, add-agent modal). Attached mode does NOT render here — it writes bytes straight to stdout. |
-| `src/app.rs` | The event loop, the mode state machine (`Overview` / `Attached` / `Adding`), attach/detach orchestration, stdin reader thread for attached mode, stable-id routing. |
+| `src/keymap.rs` | Serialize a crossterm `KeyEvent` back to the bytes a PTY child expects (chars, Alt/Ctrl-modified, arrows, F2–F12, navigation). |
+| `src/ui.rs` | All rendering: header bar, sidebar (deck) with status badges, agent pane that renders the focused agent's vt100 grid as styled ratatui spans, add-agent modal. |
+| `src/app.rs` | The event loop, focus state (`Deck` / `Agent`), modal state, PTY-resize bookkeeping, F1 hijack. |
 
 ## Data flow
 
-### Agent → terminal
+### Agent → screen
 
-1. A child process (e.g. `claude`) writes bytes to its slave PTY fd.
-2. agentdeck's per-agent **reader thread** (`agent.rs`) reads up to 8 KiB at a time from the master end and sends an `AgentEvent::Output { agent_idx, bytes }` over a single `unbounded` channel shared by all agents.
-3. The main loop drains this channel non-blocking on every tick.
-4. For every event:
-   - Bytes are fed into that agent's `vt100::Parser` so the preview pane has the latest screen state.
-   - **If currently attached to this agent**, the same bytes are also written straight to `stdout`. This is what gives you native rendering — no re-parsing, no re-emission, no fidelity loss.
+1. The child process (e.g. `claude`) writes bytes to its slave PTY fd.
+2. agentdeck's **per-agent reader thread** reads up to 8 KiB at a time from the master end and sends `AgentEvent::Output { rid, bytes }` over a single `unbounded` crossbeam channel shared by all agents.
+3. The main loop drains the channel non-blocking on every tick. For each event:
+   - Bytes are fed into that agent's `vt100::Parser` (so its `Screen` is always up to date).
+   - Activity timestamps and the rolling 500 ms byte counter on the `Agent` are updated.
+4. On the next draw, `ui::render_agent_pane` reads the focused agent's `vt100::Screen` and converts each cell into a styled ratatui `Span` (fg/bg color, bold/italic/underline/inverse). The agent's cursor position is given to ratatui via `set_cursor_position`.
 
 ### Terminal → agent
 
-There are two input pipelines depending on mode.
+1. `crossterm::event::poll` returns parsed `Event`s (key, resize, mouse).
+2. `KeyEvent`s when focus is on the agent are sent through `keymap::key_event_to_bytes`, which serializes them back to the byte sequences the inner CLI expects: e.g. `KeyCode::Up` → `\x1b[A`, `Ctrl-C` → `\x03`, `Alt-x` → `\x1b x`, modified arrows → `\x1b[1;<mods><letter>`.
+3. The resulting bytes are written to the focused agent's PTY master via `Agent::write`.
+4. When focus is on the deck, key events drive deck actions (`j`/`k`, `1-9`, `a`, `x`, `q`) and never reach an agent.
 
-**Overview mode:** `crossterm::event::poll(50ms)` + `event::read()`. We translate key events into UI actions (move cursor, attach, kill, quit) and update local state. No PTY traffic.
+The single key reserved at the agentdeck layer is `F1` — it is consumed before either branch above runs, and toggles `Focus::Deck` ↔ `Focus::Agent`. No supported agent CLI binds F1, so this is the "always free" key.
 
-**Attached mode:** crossterm is bypassed for input. A dedicated `agentdeck-stdin` thread does blocking reads from `std::io::stdin()` (which is in raw mode, so reads return raw bytes). It runs a small state machine:
-
-```
-        prefix-armed?         on byte b:
-            no    →    if b == prefix_byte:  set armed
-                       else:                 send b
-            yes   →    if b == detach_byte:  emit Detach, exit
-                       if b == prefix_byte:  send literal prefix_byte
-                       otherwise:            send prefix_byte then b
-                       (always clear armed after)
-```
-
-Output bytes are batched into an `InputEvt::Bytes(Vec<u8>)` and pushed through a bounded crossbeam channel to the main loop, which writes them to the focused agent's PTY master.
-
-The state machine is at `app.rs` in `stdin_reader`.
-
-## Mode state machine
+## Focus model
 
 ```
-                  ┌─────────────────────┐
-                  │       Overview      │
-                  └──────────┬──────────┘
-                             │ Enter / digit
-                             ▼
-                  ┌─────────────────────┐
-                  │  attach(idx) side-  │
-                  │  effects:           │
-                  │  • LeaveAlternate   │
-                  │  • Show cursor      │
-                  │  • Clear+Move(0,0)  │
-                  │  • write current    │
-                  │    screen snapshot  │
-                  │  • spawn stdin thr  │
-                  └──────────┬──────────┘
-                             │
-                             ▼
-                  ┌─────────────────────┐
-                  │  Attached { idx }   │
-                  └──────────┬──────────┘
-                             │ Ctrl-A d
-                             ▼
-                  ┌─────────────────────┐
-                  │  detach() side-     │
-                  │  effects:           │
-                  │  • drop input chan  │
-                  │  • EnterAlternate   │
-                  │  • Hide cursor      │
-                  │  • terminal.clear() │
-                  └──────────┬──────────┘
-                             ▼
-                  ┌─────────────────────┐
-                  │       Overview      │
-                  └─────────────────────┘
+                      ┌─────────────────┐
+                      │  Focus::Agent   │   ← default
+                      │  (typing goes   │
+                      │   to selected   │
+                      │   agent)        │
+                      └────────┬────────┘
+                               │  F1
+                               ▼
+                      ┌─────────────────┐
+                      │  Focus::Deck    │
+                      │  (j/k/1-9/a/x/q │
+                      │   operate on    │
+                      │   the sidebar)  │
+                      └────────┬────────┘
+                               │  Enter / digit / F1
+                               ▼
+                      ┌─────────────────┐
+                      │  Focus::Agent   │
+                      └─────────────────┘
 ```
 
-The key trick: when entering attached mode, we paint `parser.screen().contents_formatted()` to the real terminal. Those bytes deterministically reconstruct the agent's current screen state — colours, cursor position, alt-screen, the whole grid. So you don't see a blank screen waiting for the agent's next redraw.
-
-When detaching, ratatui's terminal buffer is invalid (we wrote to stdout behind its back), so we call `terminal.clear()` to force a full repaint on the next tick.
+Modal overlay (`Adding` state) takes precedence over both focus values — when present, every key feeds the cwd input box until `Enter` (spawn) or `Esc` (cancel).
 
 ## Threading rules
 
 - **Per-agent reader thread**: owns its `BoxedReader`, never touches anything else. Lives until EOF or send error.
-- **Stdin reader thread**: created at attach, exits voluntarily on detach (or on EOF/read error). Only one of these runs at a time.
-- **Main thread**: owns all `Agent` instances, both channels, and the terminal handle. Performs all writes to PTYs and all writes to stdout. Never blocks on PTY I/O.
+- **Main thread**: owns all `Agent` instances, the agent_rx channel, and the terminal handle. Performs all writes to PTYs, all drawing, all event handling. Never blocks on PTY I/O.
 
-Because all PTY *writes* and all stdout writes happen on the main thread, there is no need for `Mutex` around the agent state — the `Agent` struct is `!Sync` and never escapes the main thread.
+Because all PTY writes happen on the main thread, there is no need for `Mutex` around any `Agent` field — the struct is `!Sync` and never escapes the main thread.
 
-## vt100 vs raw passthrough — why both
+## Why we re-render the agent through ratatui
 
-You might wonder why we maintain a `vt100::Parser` per agent if attached mode just dumps bytes straight to the terminal. Two reasons:
+You might wonder why we don't just hand the terminal to the focused agent as raw bytes (which is what the old "attach" mode did). Two reasons:
 
-1. **Preview pane.** We need a structured view of the agent's screen to render the right side of the overview. Without a parser, we'd be showing a stream of raw bytes including ANSI escapes — unreadable.
-2. **Attach snapshot.** When you press Enter, the agent doesn't know to redraw. The parser has been keeping up the whole time, so we can emit `screen().contents_formatted()` to repaint the current state without involving the child process at all.
+1. **The deck has to stay visible.** A pure passthrough would let the agent's full-screen TUI repaint the entire terminal, including the area we want to keep reserved for the sidebar. We'd have to choose between "deck visible" and "agent renders natively" — and our users want the deck.
+2. **One frame, one source of truth.** With the vt100 parser sitting between the agent and the screen, the same data drives both the status badge (`state::detect`) and the displayed grid. There's no chance of the badge showing one thing while the user's view shows something else.
+
+The cost is fidelity: vt100 implements VT100/xterm sequences but not exotic protocols (sixels, Kitty graphics, ITerm2 image protocol, partial mouse-tracking flavours). For the agent CLIs we care about today, that's not a real loss.
+
+## Resize handling
+
+A single `Event::Resize(cols, rows)` recomputes `agent_pane_size` and calls `Agent::resize` on every agent, which:
+
+- calls `master.resize(PtySize)` so the slave fd's `TIOCGWINSZ` reflects the new size (modern TUIs redraw on SIGWINCH),
+- calls `parser.set_size` so our in-memory grid matches.
+
+We only resize when the *pane* size actually changes, not on every redraw.
 
 ## Live-state detection
 
 `src/state.rs` produces a `LiveState` per agent each frame. The signal hierarchy:
 
 1. **Process exited?** → `Exited(code)`.
-2. **Spawned <800ms ago?** → `Starting` (the CLI may not have drawn its first frame).
-3. **Recent activity** (bytes in the last 500ms): we either return `Working`, or — if the bottom third of the screen contains a known spinner glyph (`⠋⠙⠹…`, `◐◓◑◒`) — `Thinking`. Spinners produce lots of small redraws that aren't meaningful content change, and we don't want that to look like "the model is generating".
-4. **Quiet ≥ 4s** and provider-specific awaiting-input pattern matched → `Waiting`. The pattern check lives in `provider_awaiting_input()` and is the one place that knows about Claude Code's `│ >` input frame, Codex's `▌` cursor, Gemini's `> ` line, etc.
-5. **Quiet ≥ 45s** with no prompt match → `Stuck`.
+2. **Spawned <800 ms ago?** → `Starting`.
+3. **Recent activity** (bytes in the last 500 ms): we either return `Working`, or — if the bottom third of the screen contains a known spinner glyph (`⠋⠙⠹…`, `◐◓…`) — `Thinking`.
+4. **Quiet ≥ 4 s** and provider-specific awaiting-input pattern matched → `Waiting`. The pattern check lives in `provider_awaiting_input()` and is the one place that knows about Claude Code's `│ >` input frame, Codex's `▌` cursor, Gemini's `>` line, etc.
+5. **Quiet ≥ 45 s** with no prompt match → `Stuck`.
 6. Otherwise → `Idle`.
 
-These thresholds are tuned for "user can read the badge change as it happens" rather than instant reaction; bumping them too low makes badges flicker between Working and Idle mid-stream. Source: `state.rs:50`.
+These thresholds are tuned for "user can read the badge change as it happens" rather than instant reaction; bumping them too low makes badges flicker between Working and Idle mid-stream.
 
 When upstream CLIs redesign their UI, the provider-specific helper for that CLI is the only place that needs updating. Falling back to the `Idle` badge if a heuristic stops matching is intentional — better a vague but truthful badge than a confidently wrong one.
-
-## Resize handling
-
-- In overview mode: `crossterm::Event::Resize(cols, rows)` triggers `Agent::resize` on every PTY, which both calls `master.resize()` (so the slave sees the new size via TIOCGWINSZ) and `parser.set_size()`.
-- In attached mode: we cannot poll crossterm events without stealing stdin bytes. Instead, every ~200 ms the main loop calls `crossterm::terminal::size()` (a syscall, not stdin) and resizes the focused PTY if the size changed.
-
-A future improvement is to install a SIGWINCH handler via `signal-hook` so resizes are zero-latency in both modes.
 
 ## Logging
 
@@ -178,5 +150,6 @@ A future improvement is to install a SIGWINCH handler via `signal-hook` so resiz
 
 - **No async runtime.** Tokio was considered and rejected. The whole loop fits in `std::thread` + crossbeam channels; an executor wouldn't earn its complexity.
 - **No transcript persistence.** Each agent owns its own state. agentdeck adds zero session storage on top.
-- **No provider abstraction layer.** The `Provider` enum is a display tag, nothing more. If we ever need provider-specific behaviour (e.g. distinct "is this output a tool call?" hooks), we'll add it; until then, every CLI is treated identically.
-- **No multi-pane attached view.** You attach to *one* agent at a time. A future tiling mode is plausible but would require re-rendering all agents through vt100 + ratatui (Approach B in the design notes), which trades fidelity for layout flexibility.
+- **No provider abstraction layer.** The `Provider` enum is a display tag and a routing key for state-detection heuristics, nothing more.
+- **No mouse support yet.** Easy add (crossterm parses mouse events natively), deferred until needed.
+- **No raw-bytes passthrough mode.** The old full-screen `attach` model is gone in favour of split view; if you need perfect terminal fidelity for one specific session, run that one CLI in a separate shell.
