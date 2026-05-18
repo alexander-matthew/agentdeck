@@ -2,56 +2,99 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyEvent, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use portable_pty::PtySize;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use std::collections::{BTreeMap, HashMap};
 use std::io::stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::agent::{Agent, AgentEvent, RuntimeId, Status};
 use crate::config::{AgentConfig, Config, Provider};
 use crate::keymap::{self, Action};
-use crate::ui::{self, AddModalState, Focus, draw_main};
+use crate::ui::{self, AddModalState, Focus, ViewMode, draw_main};
+use crate::usage::{self, UsageEvent, UsageState};
 
 const SIDEBAR_WIDTH: u16 = 36;
 
+#[derive(Debug, Clone, Copy)]
 struct PaneSize {
     rows: u16,
     cols: u16,
 }
 
-fn agent_pane_size(term_cols: u16, term_rows: u16) -> PaneSize {
-    let cols = term_cols
-        .saturating_sub(SIDEBAR_WIDTH)
-        .saturating_sub(2) // agent pane block borders
-        .max(20);
-    let rows = term_rows
-        .saturating_sub(2) // header + footer rows
-        .saturating_sub(2) // agent pane block borders
-        .max(8);
-    PaneSize { rows, cols }
+/// Size each agent's PTY should be in the *current* view mode. Used to drive
+/// PTY resizes whenever the layout changes — agents only render correctly when
+/// their parser dimensions match the cell they'll be drawn into.
+fn agent_pane_size(view: ViewMode, grid: (u16, u16), term_cols: u16, term_rows: u16) -> PaneSize {
+    let avail_cols = term_cols.saturating_sub(SIDEBAR_WIDTH);
+    let avail_rows = term_rows.saturating_sub(2); // header + footer
+
+    match view {
+        ViewMode::Single => PaneSize {
+            cols: avail_cols.saturating_sub(2).max(20),
+            rows: avail_rows.saturating_sub(2).max(8),
+        },
+        ViewMode::Grid => {
+            let (gr, gc) = (grid.0.max(1), grid.1.max(1));
+            let cell_w = (avail_cols / gc).saturating_sub(2).max(20);
+            let cell_h = (avail_rows / gr).saturating_sub(2).max(5);
+            PaneSize {
+                cols: cell_w,
+                rows: cell_h,
+            }
+        }
+    }
 }
 
 pub fn run(cfg: Config) -> Result<()> {
     let mut stdout_handle = stdout();
     enable_raw_mode().context("enable raw mode")?;
-    execute!(stdout_handle, EnterAlternateScreen, Hide).context("enter alt screen")?;
+    execute!(
+        stdout_handle,
+        EnterAlternateScreen,
+        Hide,
+        EnableMouseCapture
+    )
+    .context("enter alt screen")?;
 
     let mut app = App::new(cfg)?;
     let result = app.run_loop();
 
-    execute!(stdout_handle, LeaveAlternateScreen, Show).ok();
+    execute!(
+        stdout_handle,
+        LeaveAlternateScreen,
+        Show,
+        DisableMouseCapture
+    )
+    .ok();
     disable_raw_mode().ok();
 
     result
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddingField {
+    Provider,
+    Cwd,
+}
+
 struct AddingState {
-    provider: Provider,
+    providers: Vec<Provider>,
+    selected_provider: usize,
     cwd: String,
+    cursor: usize,
+    field: AddingField,
+}
+
+struct RenamingState {
+    name: String,
     cursor: usize,
 }
 
@@ -60,22 +103,39 @@ struct App {
     agents: Vec<Agent>,
     selected: usize,
     focus: Focus,
+    view_mode: ViewMode,
+    grid_dims: (u16, u16),
+    sort_mode: ui::SortMode,
     adding: Option<AddingState>,
+    renaming: Option<RenamingState>,
     should_quit: bool,
     last_pane_dims: (u16, u16),
     next_rid: RuntimeId,
+    toggle_key: Option<KeyEvent>,
+    last_user_activity: Instant,
+    last_known_states: HashMap<RuntimeId, crate::state::LiveState>,
 
     agent_tx: Sender<AgentEvent>,
     agent_rx: Receiver<AgentEvent>,
+
+    showing_usage: bool,
+    usage_state: UsageState,
+    usage_tx: Sender<UsageEvent>,
+    usage_rx: Receiver<UsageEvent>,
+    usage_commands: BTreeMap<String, String>,
+    usage_refresh_interval: Duration,
+    last_usage_refresh: Option<Instant>,
 }
 
 impl App {
     fn new(cfg: Config) -> Result<Self> {
+        let toggle_key = keymap::parse_key(&cfg.settings.toggle_key);
         let backend = CrosstermBackend::new(stdout());
         let terminal = Terminal::new(backend).context("new terminal")?;
 
         let (term_cols, term_rows) = crossterm::terminal::size().context("query terminal size")?;
-        let pane = agent_pane_size(term_cols, term_rows);
+        let grid_dims = (cfg.settings.grid_rows.max(1), cfg.settings.grid_cols.max(1));
+        let pane = agent_pane_size(ViewMode::Single, grid_dims, term_cols, term_rows);
         let initial_size = PtySize {
             rows: pane.rows,
             cols: pane.cols,
@@ -105,36 +165,71 @@ impl App {
             return Err(anyhow::anyhow!("no agents could be spawned"));
         }
 
+        let usage_state = UsageState::from_commands(&cfg.usage_commands);
+        let (usage_tx, usage_rx) = unbounded::<UsageEvent>();
+
         Ok(Self {
             terminal,
             agents,
             selected: 0,
             focus: Focus::Agent,
+            view_mode: ViewMode::Single,
+            grid_dims,
+            sort_mode: ui::SortMode::Provider,
             adding: None,
+            renaming: None,
             should_quit: false,
             last_pane_dims: (pane.cols, pane.rows),
             next_rid,
+            toggle_key,
+            last_user_activity: Instant::now(),
+            last_known_states: HashMap::new(),
             agent_tx,
             agent_rx,
+            showing_usage: false,
+            usage_state,
+            usage_tx,
+            usage_rx,
+            usage_commands: cfg.usage_commands,
+            usage_refresh_interval: Duration::from_secs(cfg.settings.usage_refresh_secs.max(5)),
+            last_usage_refresh: None,
         })
     }
 
     fn run_loop(&mut self) -> Result<()> {
+        // Kick off an initial refresh so the dashboard isn't empty on first open.
+        self.refresh_usage_all();
+
         while !self.should_quit {
             self.handle_pty_output();
             self.poll_agent_exits();
+            self.drain_usage_events();
+            self.maybe_tick_usage_refresh();
 
-            let model = ui::build_rows(&self.agents);
+            let model = ui::build_rows(&self.agents, self.sort_mode);
             if !model.selectable.is_empty() {
                 self.selected = self.selected.min(model.selectable.len() - 1);
             }
 
+            self.evaluate_smart_focus(&model);
+
+            let visible_agents = self.visible_agents(&model);
             let footer = self.footer_for();
             let modal = self.adding.as_ref().map(|s| AddModalState {
-                provider: s.provider,
-                cwd: s.cwd.as_str(),
+                providers: &s.providers,
+                selected_provider: s.selected_provider,
+                cwd: &s.cwd,
                 cursor: s.cursor,
             });
+            let rename_modal = self.renaming.as_ref().map(|s| ui::RenameModalState {
+                name: &s.name,
+                cursor: s.cursor,
+            });
+            let tk_label = self.toggle_key_label();
+            let view = self.view_mode;
+            let grid = self.grid_dims;
+            let showing_usage = self.showing_usage;
+            let usage_snapshot = self.usage_state.clone();
             self.terminal.draw(|f| {
                 draw_main(
                     f,
@@ -142,8 +237,15 @@ impl App {
                     &model,
                     self.selected,
                     self.focus,
+                    view,
+                    grid,
+                    &visible_agents,
+                    showing_usage,
+                    &usage_snapshot,
                     &footer,
                     modal,
+                    rename_modal,
+                    &tk_label,
                 )
             })?;
 
@@ -185,15 +287,165 @@ impl App {
         }
     }
 
+    fn drain_usage_events(&mut self) {
+        while let Ok(ev) = self.usage_rx.try_recv() {
+            self.usage_state.apply(ev);
+        }
+    }
+
+    fn maybe_tick_usage_refresh(&mut self) {
+        if self.usage_commands.is_empty() {
+            return;
+        }
+        let due = match self.last_usage_refresh {
+            None => true,
+            Some(t) => t.elapsed() >= self.usage_refresh_interval,
+        };
+        if due {
+            self.refresh_usage_all();
+        }
+    }
+
+    fn refresh_usage_all(&mut self) {
+        for (provider, command) in self.usage_commands.iter() {
+            let cmd = command.trim();
+            if cmd.is_empty() {
+                continue;
+            }
+            usage::spawn_refresh(provider.clone(), cmd.to_string(), self.usage_tx.clone());
+        }
+        self.last_usage_refresh = Some(Instant::now());
+    }
+
+    fn evaluate_smart_focus(&mut self, model: &ui::RowModel) {
+        use crate::state::{self, LiveState};
+        let now = Instant::now();
+        let mut target_rid = None;
+
+        for agent in &self.agents {
+            let current_state = state::detect(agent);
+            let prev_state = self
+                .last_known_states
+                .get(&agent.rid)
+                .copied()
+                .unwrap_or(LiveState::Idle);
+
+            // Detect transition to Waiting
+            if current_state == LiveState::Waiting && prev_state != LiveState::Waiting {
+                let current_agent_idx = self.agent_idx_at_selected(model);
+                let is_current = current_agent_idx
+                    .map(|i| self.agents[i].rid == agent.rid)
+                    .unwrap_or(false);
+
+                if !is_current {
+                    let user_idle =
+                        now.duration_since(self.last_user_activity) > Duration::from_secs(2);
+                    let current_agent_idle = if let Some(idx) = current_agent_idx {
+                        let s = state::detect(&self.agents[idx]);
+                        matches!(s, LiveState::Idle | LiveState::Exited(_) | LiveState::Stuck)
+                    } else {
+                        true
+                    };
+
+                    if user_idle && current_agent_idle {
+                        target_rid = Some(agent.rid);
+                    }
+                }
+            }
+            self.last_known_states.insert(agent.rid, current_state);
+        }
+
+        if let Some(rid) = target_rid
+            && let Some(agent_idx) = self.agents.iter().position(|a| a.rid == rid)
+        {
+            for (selectable_idx, &row_idx) in model.selectable.iter().enumerate() {
+                if let Some(ui::Row::Agent(ai)) = model.rows.get(row_idx)
+                    && *ai == agent_idx
+                {
+                    self.selected = selectable_idx;
+                    self.focus = Focus::Agent;
+                    break;
+                }
+            }
+        }
+    }
+
     fn footer_for(&self) -> String {
         if self.adding.is_some() {
             return " Enter: spawn   Esc: cancel ".into();
         }
+        if self.renaming.is_some() {
+            return " Enter: save   Esc: cancel ".into();
+        }
+        if self.showing_usage {
+            return " r: refresh now   u / Esc: close usage   q: quit ".into();
+        }
+        let tk = self.toggle_key_label();
+        let view_chip = match self.view_mode {
+            ViewMode::Single => "single",
+            ViewMode::Grid => "grid",
+        };
         match self.focus {
-            Focus::Agent => " typing → focused agent   F1 → deck   Ctrl-C → interrupt agent ".into(),
-            Focus::Deck => {
-                " ↑/↓ select   1-9 focus   Enter focus agent   a add   x remove   q quit   F1 → agent "
-                    .into()
+            Focus::Agent => format!(
+                " typing → focused agent   {tk} → deck   Ctrl-C → interrupt   [{view_chip}] "
+            ),
+            Focus::Deck => format!(
+                " ↑/↓ select   1-9 focus   Tab jump   Enter focus   a add   x remove   r rename   o sort   g grid   u usage   q quit   {tk} → agent   [{view_chip}] "
+            ),
+        }
+    }
+
+    fn toggle_key_label(&self) -> String {
+        match self.toggle_key {
+            Some(k) => {
+                let mut s = String::new();
+                if k.modifiers.contains(event::KeyModifiers::CONTROL) {
+                    s.push_str("Ctrl-");
+                }
+                if k.modifiers.contains(event::KeyModifiers::ALT) {
+                    s.push_str("Alt-");
+                }
+                if k.modifiers.contains(event::KeyModifiers::SHIFT) {
+                    s.push_str("Shift-");
+                }
+                if k.modifiers.contains(event::KeyModifiers::SUPER) {
+                    s.push_str("Cmd-");
+                }
+                match k.code {
+                    event::KeyCode::F(n) => s.push_str(&format!("F{n}")),
+                    event::KeyCode::Char(' ') => s.push_str("Space"),
+                    event::KeyCode::Char(c) => s.push_str(&c.to_uppercase().to_string()),
+                    event::KeyCode::Esc => s.push_str("Esc"),
+                    event::KeyCode::Enter => s.push_str("Enter"),
+                    _ => s.push_str("Key"),
+                }
+                s
+            }
+            None => "Ctrl-Space".into(),
+        }
+    }
+
+    /// Agent indices that should be rendered in the right pane area right now.
+    /// Single mode shows just the selected agent; Grid mode shows the page that
+    /// contains the selected agent.
+    fn visible_agents(&self, model: &ui::RowModel) -> Vec<usize> {
+        match self.view_mode {
+            ViewMode::Single => self
+                .agent_idx_at_selected(model)
+                .map(|i| vec![i])
+                .unwrap_or_default(),
+            ViewMode::Grid => {
+                let page_size = (self.grid_dims.0 as usize) * (self.grid_dims.1 as usize);
+                if page_size == 0 || model.selectable.is_empty() {
+                    return Vec::new();
+                }
+                let n = model.selectable.len();
+                let page = self.selected / page_size;
+                let start = page * page_size;
+                let end = (start + page_size).min(n);
+                (start..end)
+                    .filter_map(|i| self.agent_idx_at_selectable(model, i))
+                    .collect()
             }
         }
     }
@@ -201,7 +453,7 @@ impl App {
     fn handle_event(&mut self, ev: Event, model: &ui::RowModel) -> Result<()> {
         match ev {
             Event::Resize(cols, rows) => {
-                let pane = agent_pane_size(cols, rows);
+                let pane = agent_pane_size(self.view_mode, self.grid_dims, cols, rows);
                 if (pane.cols, pane.rows) != self.last_pane_dims {
                     self.last_pane_dims = (pane.cols, pane.rows);
                     for a in self.agents.iter_mut() {
@@ -210,12 +462,13 @@ impl App {
                 }
             }
             Event::Key(k) if k.kind == KeyEventKind::Press => {
+                self.last_user_activity = Instant::now();
                 if let Some(state) = self.adding.as_mut() {
                     let result = handle_adding_event(k, state);
                     match result {
                         AddingResult::Spawn => {
                             let cwd = state.cwd.trim().to_string();
-                            let provider = state.provider;
+                            let provider = state.providers[state.selected_provider];
                             self.adding = None;
                             self.spawn_runtime_agent(provider, &cwd);
                         }
@@ -225,21 +478,117 @@ impl App {
                     return Ok(());
                 }
 
+                if let Some(state) = self.renaming.as_mut() {
+                    match k.code {
+                        KeyCode::Esc => self.renaming = None,
+                        KeyCode::Enter => {
+                            let new_name = state.name.trim().to_string();
+                            if !new_name.is_empty()
+                                && let Some(ai) = self.agent_idx_at_selected(model)
+                                && let Some(agent) = self.agents.get_mut(ai)
+                            {
+                                agent.name = new_name;
+                            }
+                            self.renaming = None;
+                        }
+                        KeyCode::Char(c) => {
+                            let idx = byte_index_for_char_cursor(&state.name, state.cursor);
+                            state.name.insert(idx, c);
+                            state.cursor += 1;
+                        }
+                        KeyCode::Backspace if state.cursor > 0 => {
+                            let end = byte_index_for_char_cursor(&state.name, state.cursor);
+                            let start = byte_index_for_char_cursor(&state.name, state.cursor - 1);
+                            state.name.drain(start..end);
+                            state.cursor -= 1;
+                        }
+                        KeyCode::Left if state.cursor > 0 => state.cursor -= 1,
+                        KeyCode::Right if state.cursor < state.name.chars().count() => {
+                            state.cursor += 1;
+                        }
+                        _ => {}
+                    }
+                    return Ok(());
+                }
+
+                if self.showing_usage {
+                    self.handle_usage_key(k);
+                    return Ok(());
+                }
+
                 if self.focus == Focus::Deck {
-                    let action = keymap::map_deck_key(k);
+                    let action = keymap::map_deck_key(k, self.toggle_key);
                     self.handle_action(action, model)?;
                 } else {
-                    // Check for F1 toggle even in agent focus mode.
-                    if k.code == event::KeyCode::F(1) {
+                    // Check for toggle focus even in agent focus mode. If the
+                    // configured key didn't parse, fall back to the default
+                    // (Ctrl-Space) so a typo'd config still has *some* escape.
+                    let is_toggle = if let Some(tk) = self.toggle_key {
+                        k.code == tk.code && k.modifiers == tk.modifiers
+                    } else {
+                        k.code == event::KeyCode::Char(' ')
+                            && k.modifiers.contains(event::KeyModifiers::CONTROL)
+                    };
+
+                    if is_toggle {
                         self.focus = Focus::Deck;
                     } else {
+                        if let Some(agent) = self.current_agent_mut(model) {
+                            agent.scroll_offset = 0;
+                        }
                         self.forward_to_agent(k, model);
                     }
                 }
             }
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::Down(event::MouseButton::Left) => {
+                    if m.column < SIDEBAR_WIDTH && m.row >= 2 {
+                        let row_idx = (m.row - 2) as usize;
+                        if let Some(pos) = model.selectable.iter().position(|&r| r == row_idx) {
+                            self.selected = pos;
+                            self.focus = Focus::Agent;
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(agent) = self.current_agent_mut(model) {
+                        agent.scroll_up(1);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(agent) = self.current_agent_mut(model) {
+                        agent.scroll_down(1);
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_usage_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('u') => {
+                self.showing_usage = false;
+            }
+            KeyCode::Char('r') => {
+                self.refresh_usage_all();
+            }
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('c') if k.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn current_agent_mut(&mut self, model: &ui::RowModel) -> Option<&mut Agent> {
+        let row_idx = *model.selectable.get(self.selected)?;
+        let ui::Row::Agent(agent_idx) = model.rows.get(row_idx)? else {
+            return None;
+        };
+        self.agents.get_mut(*agent_idx)
     }
 
     fn handle_action(&mut self, action: Action, model: &ui::RowModel) -> Result<()> {
@@ -254,16 +603,30 @@ impl App {
         }
         match action {
             Action::AddAgent => {
-                if let Some(ai) = self.agent_idx_at_selected(model) {
+                let providers = vec![
+                    Provider::Claude,
+                    Provider::Codex,
+                    Provider::Gemini,
+                    Provider::Aider,
+                    Provider::Shell,
+                    Provider::Other,
+                ];
+                let (provider_idx, cwd) = if let Some(ai) = self.agent_idx_at_selected(model) {
                     let a = &self.agents[ai];
+                    let idx = providers.iter().position(|&p| p == a.provider).unwrap_or(0);
                     let cwd = a.cwd_label.clone().unwrap_or_else(|| "~".into());
-                    let cursor = cwd.chars().count();
-                    self.adding = Some(AddingState {
-                        provider: a.provider,
-                        cwd,
-                        cursor,
-                    });
-                }
+                    (idx, cwd)
+                } else {
+                    (0, "~".into())
+                };
+                let cursor = cwd.chars().count();
+                self.adding = Some(AddingState {
+                    providers,
+                    selected_provider: provider_idx,
+                    cwd,
+                    cursor,
+                    field: AddingField::Provider,
+                });
             }
             Action::RemoveAgent => {
                 if let Some(ai) = self.agent_idx_at_selected(model)
@@ -273,6 +636,51 @@ impl App {
                     self.agents.remove(ai);
                 }
             }
+            Action::RenameAgent => {
+                if let Some(ai) = self.agent_idx_at_selected(model) {
+                    let a = &self.agents[ai];
+                    self.renaming = Some(RenamingState {
+                        name: a.name.clone(),
+                        cursor: a.name.chars().count(),
+                    });
+                }
+            }
+            Action::CycleSort => {
+                self.sort_mode = match self.sort_mode {
+                    ui::SortMode::Provider => ui::SortMode::Status,
+                    ui::SortMode::Status => ui::SortMode::Created,
+                    ui::SortMode::Created => ui::SortMode::Provider,
+                };
+            }
+            Action::ToggleView => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Single => ViewMode::Grid,
+                    ViewMode::Grid => ViewMode::Single,
+                };
+                self.resync_pty_sizes();
+            }
+            Action::ToggleUsage => {
+                self.showing_usage = !self.showing_usage;
+                if self.showing_usage {
+                    self.maybe_tick_usage_refresh();
+                }
+            }
+            Action::FocusNextWaiting => {
+                let n = model.selectable.len();
+                if n > 0 {
+                    for i in 1..=n {
+                        let idx = (self.selected + i) % n;
+                        if let Some(agent_idx) = self.agent_idx_at_selectable(model, idx) {
+                            let state = crate::state::detect(&self.agents[agent_idx]);
+                            if state == crate::state::LiveState::Waiting {
+                                self.selected = idx;
+                                self.focus = Focus::Agent;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             // Nav actions (Quit/MoveUp/MoveDown/FocusAgent/FocusIndex/ToggleFocus/None)
             // are already handled above via `apply_nav_action`.
             _ => {}
@@ -280,8 +688,28 @@ impl App {
         Ok(())
     }
 
+    fn resync_pty_sizes(&mut self) {
+        let (term_cols, term_rows) = match crossterm::terminal::size() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let pane = agent_pane_size(self.view_mode, self.grid_dims, term_cols, term_rows);
+        self.last_pane_dims = (pane.cols, pane.rows);
+        for a in self.agents.iter_mut() {
+            a.resize(pane.rows, pane.cols);
+        }
+    }
+
     fn agent_idx_at_selected(&self, model: &ui::RowModel) -> Option<usize> {
         agent_idx_at(self.selected, model)
+    }
+
+    fn agent_idx_at_selectable(
+        &self,
+        model: &ui::RowModel,
+        selectable_idx: usize,
+    ) -> Option<usize> {
+        agent_idx_at(selectable_idx, model)
     }
 
     fn spawn_runtime_agent(&mut self, provider: Provider, cwd: &str) {
@@ -326,35 +754,64 @@ fn handle_adding_event(k: KeyEvent, state: &mut AddingState) -> AddingResult {
     match k.code {
         event::KeyCode::Esc => AddingResult::Cancel,
         event::KeyCode::Enter => AddingResult::Spawn,
+        event::KeyCode::Tab => {
+            state.field = match state.field {
+                AddingField::Provider => AddingField::Cwd,
+                AddingField::Cwd => AddingField::Provider,
+            };
+            AddingResult::None
+        }
         event::KeyCode::Char('c') if k.modifiers.contains(event::KeyModifiers::CONTROL) => {
             AddingResult::Cancel
         }
-        event::KeyCode::Char(c) => {
+        event::KeyCode::Left => {
+            match state.field {
+                AddingField::Provider => {
+                    if state.selected_provider > 0 {
+                        state.selected_provider -= 1;
+                    } else {
+                        state.selected_provider = state.providers.len() - 1;
+                    }
+                }
+                AddingField::Cwd => {
+                    if state.cursor > 0 {
+                        state.cursor -= 1;
+                    }
+                }
+            }
+            AddingResult::None
+        }
+        event::KeyCode::Right => {
+            match state.field {
+                AddingField::Provider => {
+                    state.selected_provider = (state.selected_provider + 1) % state.providers.len();
+                }
+                AddingField::Cwd => {
+                    if state.cursor < state.cwd.chars().count() {
+                        state.cursor += 1;
+                    }
+                }
+            }
+            AddingResult::None
+        }
+        event::KeyCode::Char(c) if state.field == AddingField::Cwd => {
             let idx = byte_index_for_char_cursor(&state.cwd, state.cursor);
             state.cwd.insert(idx, c);
             state.cursor += 1;
             AddingResult::None
         }
-        event::KeyCode::Backspace if state.cursor > 0 => {
+        event::KeyCode::Backspace if state.field == AddingField::Cwd && state.cursor > 0 => {
             let end = byte_index_for_char_cursor(&state.cwd, state.cursor);
             let start = byte_index_for_char_cursor(&state.cwd, state.cursor - 1);
             state.cwd.drain(start..end);
             state.cursor -= 1;
             AddingResult::None
         }
-        event::KeyCode::Left if state.cursor > 0 => {
-            state.cursor -= 1;
-            AddingResult::None
-        }
-        event::KeyCode::Right if state.cursor < state.cwd.chars().count() => {
-            state.cursor += 1;
-            AddingResult::None
-        }
-        event::KeyCode::Home => {
+        event::KeyCode::Home if state.field == AddingField::Cwd => {
             state.cursor = 0;
             AddingResult::None
         }
-        event::KeyCode::End => {
+        event::KeyCode::End if state.field == AddingField::Cwd => {
             state.cursor = state.cwd.chars().count();
             AddingResult::None
         }
@@ -381,15 +838,21 @@ fn derive_child_config(
         .find(|a| a.provider == provider)
         .map(|a| a.template.clone());
 
-    let mut cfg = template.unwrap_or_else(|| AgentConfig {
-        id: format!("{}-{rid}", provider.tag()),
-        name: None,
-        provider,
-        command: provider.tag().to_string(),
-        args: vec![],
-        cwd: None,
-        env: Default::default(),
-        manual: false,
+    let mut cfg = template.unwrap_or_else(|| {
+        let command = match provider {
+            Provider::Shell => std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into()),
+            _ => provider.tag().to_string(),
+        };
+        AgentConfig {
+            id: format!("{}-{rid}", provider.tag()),
+            name: None,
+            provider,
+            command,
+            args: vec![],
+            cwd: None,
+            env: Default::default(),
+            manual: false,
+        }
     });
 
     let trimmed = cwd.trim();
@@ -413,6 +876,7 @@ fn provider_display(p: Provider) -> &'static str {
         Provider::Codex => "Codex",
         Provider::Gemini => "Gemini",
         Provider::Aider => "Aider",
+        Provider::Shell => "Shell",
         Provider::Other => "agent",
     }
 }
@@ -458,7 +922,13 @@ fn apply_nav_action(
             };
         }
         Action::None => {}
-        Action::AddAgent | Action::RemoveAgent => return false,
+        Action::AddAgent
+        | Action::RemoveAgent
+        | Action::RenameAgent
+        | Action::CycleSort
+        | Action::ToggleView
+        | Action::ToggleUsage
+        | Action::FocusNextWaiting => return false,
     }
     true
 }
@@ -508,7 +978,13 @@ mod tests {
         model: &ui::RowModel,
     ) {
         let ev = KeyEvent::new(code, mods);
-        apply_nav_action(map_deck_key(ev), &mut st.0, &mut st.1, &mut st.2, model);
+        apply_nav_action(
+            map_deck_key(ev, None),
+            &mut st.0,
+            &mut st.1,
+            &mut st.2,
+            model,
+        );
     }
 
     #[test]
@@ -551,12 +1027,13 @@ mod tests {
     }
 
     #[test]
-    fn f1_toggles_focus() {
+    fn ctrl_space_toggles_focus() {
+        // With no configured toggle_key, map_deck_key falls back to Ctrl-Space.
         let model = fake_model(1);
         let mut st = (0, Focus::Deck, false);
-        apply(KeyCode::F(1), KeyModifiers::NONE, &mut st, &model);
+        apply(KeyCode::Char(' '), KeyModifiers::CONTROL, &mut st, &model);
         assert_eq!(st.1, Focus::Agent);
-        apply(KeyCode::F(1), KeyModifiers::NONE, &mut st, &model);
+        apply(KeyCode::Char(' '), KeyModifiers::CONTROL, &mut st, &model);
         assert_eq!(st.1, Focus::Deck);
     }
 }

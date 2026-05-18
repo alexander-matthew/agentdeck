@@ -18,15 +18,27 @@ pub enum Action {
     AddAgent,
     RemoveAgent,
     ToggleFocus,
+    CycleSort,
+    /// Cycle between single-pane and multi-pane grid view.
+    ToggleView,
+    /// Show / hide the centralized usage dashboard.
+    ToggleUsage,
+    FocusNextWaiting,
+    RenameAgent,
     None,
 }
 
-pub fn map_deck_key(ev: KeyEvent) -> Action {
+pub fn map_deck_key(ev: KeyEvent, toggle_key: Option<KeyEvent>) -> Action {
     if ev.kind != KeyEventKind::Press {
         return Action::None;
     }
 
-    if ev.code == KeyCode::F(1) {
+    if let Some(tk) = toggle_key {
+        if ev.code == tk.code && ev.modifiers == tk.modifiers {
+            return Action::ToggleFocus;
+        }
+    } else if ev.code == KeyCode::Char(' ') && ev.modifiers.contains(KeyModifiers::CONTROL) {
+        // Fallback when [settings].toggle_key in config didn't parse.
         return Action::ToggleFocus;
     }
 
@@ -45,9 +57,62 @@ pub fn map_deck_key(ev: KeyEvent) -> Action {
 
         KeyCode::Char('a') | KeyCode::Char('+') => Action::AddAgent,
         KeyCode::Char('x') => Action::RemoveAgent,
+        KeyCode::Char('r') => Action::RenameAgent,
+        KeyCode::Char('o') => Action::CycleSort,
+        KeyCode::Char('g') => Action::ToggleView,
+        KeyCode::Char('u') => Action::ToggleUsage,
+        KeyCode::Tab => Action::FocusNextWaiting,
 
         _ => Action::None,
     }
+}
+
+pub fn parse_key(s: &str) -> Option<KeyEvent> {
+    let s = s.to_lowercase();
+    let parts: Vec<&str> = s.split('-').collect();
+
+    let mut mods = KeyModifiers::empty();
+    let code_str = if parts.len() > 1 {
+        for &p in &parts[..parts.len() - 1] {
+            match p {
+                "ctrl" | "control" => mods.insert(KeyModifiers::CONTROL),
+                "alt" | "opt" | "option" => mods.insert(KeyModifiers::ALT),
+                "shift" => mods.insert(KeyModifiers::SHIFT),
+                "super" | "cmd" | "command" => mods.insert(KeyModifiers::SUPER),
+                _ => {}
+            }
+        }
+        parts[parts.len() - 1]
+    } else {
+        parts[0]
+    };
+
+    let code = match code_str {
+        "f1" => KeyCode::F(1),
+        "f2" => KeyCode::F(2),
+        "f3" => KeyCode::F(3),
+        "f4" => KeyCode::F(4),
+        "f5" => KeyCode::F(5),
+        "f6" => KeyCode::F(6),
+        "f7" => KeyCode::F(7),
+        "f8" => KeyCode::F(8),
+        "f9" => KeyCode::F(9),
+        "f10" => KeyCode::F(10),
+        "f11" => KeyCode::F(11),
+        "f12" => KeyCode::F(12),
+        "enter" => KeyCode::Enter,
+        "tab" => KeyCode::Tab,
+        "esc" | "escape" => KeyCode::Esc,
+        "space" => KeyCode::Char(' '),
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        c if c.len() == 1 => KeyCode::Char(c.chars().next().unwrap()),
+        _ => return None,
+    };
+
+    Some(KeyEvent::new(code, mods))
 }
 
 pub fn key_event_to_bytes(ev: &KeyEvent) -> Option<Vec<u8>> {

@@ -49,12 +49,13 @@ There is no separate stdin reader thread anymore. The main loop pulls everything
 | File | Role |
 | --- | --- |
 | `src/main.rs` | CLI parsing (`clap`), tracing setup, config resolution, dispatch to `app::run`. |
-| `src/config.rs` | `Config`, `Settings`, `AgentConfig`, `Provider`. Load-or-init logic, path expansion. |
+| `src/config.rs` | `Config`, `Settings`, `AgentConfig`, `Provider`, and the `usage_commands` map. Load-or-init logic, path expansion. |
 | `src/agent.rs` | `Agent` struct, PTY spawn, reader thread, vt100 parser, activity timestamps, exit polling. |
 | `src/state.rs` | `LiveState` enum and `detect()` function: combines activity windows with provider-specific terminal-output heuristics to label what an agent is doing. |
 | `src/keymap.rs` | Centralized key handling: mapping UI actions for the deck AND serializing agent input back to PTY bytes. |
-| `src/ui.rs` | All rendering: header bar, sidebar (deck) with status badges, agent pane that renders the focused agent's vt100 grid as styled ratatui spans, add-agent modal. |
-| `src/app.rs` | The core `App` struct and event loop, mode management, attach/detach orchestration. |
+| `src/usage.rs` | Centralized usage dashboard: `UsageState`, `UsageEvent`, and the per-provider `spawn_refresh()` that runs shell commands in background threads with a timeout and an output cap. |
+| `src/ui.rs` | All rendering: header bar, sidebar (deck) with status badges, single-agent pane, multi-pane grid layout, usage dashboard cards, add/rename modals. `ViewMode` enum lives here. |
+| `src/app.rs` | The core `App` struct and event loop, view-mode + focus management, smart-focus auto-switching, usage poller orchestration, add/rename modal state. |
 
 ## Data flow
 
@@ -65,7 +66,7 @@ There is no separate stdin reader thread anymore. The main loop pulls everything
 3. The main loop drains the channel non-blocking on every tick. For each event:
    - Bytes are fed into that agent's `vt100::Parser` (so its `Screen` is always up to date).
    - Activity timestamps and the rolling 500 ms byte counter on the `Agent` are updated.
-4. On the next draw, `ui::render_agent_pane` reads the focused agent's `vt100::Screen` and converts each cell into a styled ratatui `Span` (fg/bg color, bold/italic/underline/inverse). The agent's cursor position is given to ratatui via `set_cursor_position`.
+4. On the next draw, `ui::render_agent_cell` reads each visible agent's `vt100::Screen` and converts each cell into a styled ratatui `Span` (fg/bg color, bold/italic/underline/inverse). The input-target cell's cursor is given to ratatui via `set_cursor_position`. In single-pane mode there's one such cell; in grid mode `render_agent_grid` lays out `grid_rows × grid_cols` cells and calls `render_agent_cell` for each.
 
 ### Terminal → agent
 
@@ -74,7 +75,7 @@ There is no separate stdin reader thread anymore. The main loop pulls everything
 3. The resulting bytes are written to the focused agent's PTY master via `Agent::write`.
 4. When focus is on the deck, key events drive deck actions (`j`/`k`, `1-9`, `a`, `x`, `q`) via `keymap::map_deck_key` and never reach an agent.
 
-The single key reserved at the agentdeck layer is `F1` — it is consumed before either branch above runs, and toggles `Focus::Deck` ↔ `Focus::Agent`. No supported agent CLI binds F1, so this is the "always free" key.
+The single key reserved at the agentdeck layer is `Ctrl-Space` (configurable via `[settings] toggle_key`) — it is consumed before either branch above runs, and toggles `Focus::Deck` ↔ `Focus::Agent`. None of the supported agent CLIs bind Ctrl-Space, and no OS or window manager grabs it first, which is why it's the default.
 
 ## Focus model
 
@@ -85,7 +86,7 @@ The single key reserved at the agentdeck layer is `F1` — it is consumed before
                       │   to selected   │
                       │   agent)        │
                       └────────┬────────┘
-                               │  F1
+                               │  Ctrl-Space
                                ▼
                       ┌─────────────────┐
                       │  Focus::Deck    │
@@ -93,14 +94,36 @@ The single key reserved at the agentdeck layer is `F1` — it is consumed before
                       │   operate on    │
                       │   the sidebar)  │
                       └────────┬────────┘
-                               │  Enter / digit / F1
+                               │  Enter / digit / Ctrl-Space
                                ▼
                       ┌─────────────────┐
                       │  Focus::Agent   │
                       └─────────────────┘
 ```
 
-Modal overlay (`Adding` state) takes precedence over both focus values — when present, every key feeds the cwd input box until `Enter` (spawn) or `Esc` (cancel).
+Modal overlays (`Adding` and `Renaming` state) take precedence over both focus values — when present, every key feeds that overlay's input box until `Enter` (commit) or `Esc` (cancel).
+
+The usage dashboard (`u`) is a *third* render path for the right pane: it doesn't change `Focus`, but while `showing_usage` is true the key handler dispatches to `handle_usage_key` (which understands `r` / `u` / `Esc`) instead of forwarding to the focused agent.
+
+## View mode
+
+The right-hand pane area can be in one of three render modes, picked in this priority order each frame:
+
+1. **Usage dashboard** (`showing_usage == true`, toggled by `u`). Renders `UsageState` as a stack of provider cards.
+2. **Single** (`view_mode == Single`, default). Renders the selected agent full-pane.
+3. **Grid** (`view_mode == Grid`, toggled by `g`). Renders the page of agents containing the selected one in a `grid_rows × grid_cols` mosaic. The page is `selected / (grid_rows * grid_cols)`, so navigation always keeps the selected agent visible.
+
+Toggling `view_mode` or resizing the terminal recomputes the per-agent PTY size via `agent_pane_size(view, grid, term_cols, term_rows)` and calls `Agent::resize` on every agent, so child TUIs redraw to fit their cell.
+
+## Usage poller
+
+`src/usage.rs` exposes `spawn_refresh(provider, command, tx)`. The main loop calls it from `App::refresh_usage_all` either on the configured cadence (`usage_refresh_secs`, clamped to ≥ 5 s) or when the user presses `r` inside the dashboard. Each call:
+
+1. Sends a `UsageEvent::Started { provider }` so the UI can render a "refreshing…" title.
+2. Spawns a short-lived thread that runs `sh -c <command>` with stdout/stderr piped, polling `try_wait` until exit or a 20 s timeout. stdout is captured up to 64 KB.
+3. Sends a `UsageEvent::Result { provider, output, error, at }` back to the main loop, which folds it into `UsageState`.
+
+Failures (non-zero exit, timeout, spawn error) attach an `error` message and don't overwrite the previous good output, so a transient breakage doesn't blank the card.
 
 ## Threading rules
 

@@ -8,6 +8,7 @@ mod config;
 mod keymap;
 mod state;
 mod ui;
+mod usage;
 
 #[derive(Parser, Debug)]
 #[command(

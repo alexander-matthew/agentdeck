@@ -20,6 +20,7 @@ CLI command: `claude` (from `@anthropic-ai/claude-code`).
 | Each agentdeck-launched `claude` process is a completely separate conversation. Context is not shared with other instances. |
 | Pro and Max subscriptions cover Claude Code usage; usage limits apply per the [subscription terms](https://www.anthropic.com/pricing). Running many concurrent sessions does not raise the cap. |
 | Useful flags to pin per agent: `--model <id>`, `--working-directory <dir>` (or just set `cwd` in the config). |
+| **Usage dashboard.** Default `[usage_commands] claude = "npx -y ccusage@latest --json"` calls [ccusage](https://www.npmjs.com/package/ccusage), which parses Claude Code's local session logs to produce a daily token / cost breakdown. The JSON is verbose; for a tighter card swap in the plain-text mode (`npx -y ccusage@latest daily`). |
 | To run agentdeck *inside* the [dev-sandbox](https://github.com/alexander-matthew/dev-sandbox) devcontainer so Claude can't reach host secrets, install `@anthropic-ai/claude-code` in the container image and point `command` at it there. |
 
 ## Codex CLI
@@ -42,6 +43,20 @@ CLI command: `gemini` (Google's official CLI).
 | Free-tier daily quotas are tight; if you run several instances expect to hit them. |
 | The CLI uses fairly standard ANSI; renders cleanly under agentdeck's PTY. |
 
+## Aider
+
+CLI command: `aider` (from [`aider-chat`](https://aider.chat/)).
+
+| Note |
+| --- |
+| Auth is whatever provider you've pointed Aider at — OpenAI key, Anthropic key, local model via Ollama, etc. agentdeck doesn't see any of it. |
+| The awaiting-input heuristic looks for the `> ` prompt near the bottom of the screen. If Aider's UI shifts and the prompt moves, update `aider_awaiting_input` in `src/state.rs`. |
+| No first-party usage tool ships with Aider; if you want a card in the dashboard, point `[usage_commands] aider` at your own script that summarises whatever upstream provider you're driving it with. |
+
+## Shell
+
+`provider = "shell"` is supported as a first-class option — agentdeck spawns whatever's in `$SHELL` (or `/bin/bash` as fallback). Useful as a scratch pane next to your AI agents without leaving the deck.
+
 ## Anything else
 
 Any other agent-style CLI works as long as it:
@@ -57,4 +72,4 @@ To add one, just add another `[[agent]]` block with `provider = "other"` and you
 - **Shell aliases don't apply.** agentdeck does not source your `.bashrc`/`.zshrc`. If you wrap the CLI in a shell function, replace that function with a real script and point `command` at the script.
 - **MCP servers and tool configs.** These are managed by each CLI; nothing in agentdeck changes them. Concurrent agents sharing an MCP server on the same machine will compete for that server's resources.
 - **Working directory matters.** Many agent CLIs anchor their context to the cwd. Set `cwd` per agent if you want one focused on `~/code/A` and another on `~/code/B`.
-- **Terminal size.** Each PTY is sized to the host terminal at startup, and resized when you change the terminal during attach (polled at ~200 ms). While in the overview the PTY size is held constant at `(host_rows - 3) × host_cols` so the agent's render fits inside the preview pane's expected geometry.
+- **Terminal size.** Each PTY is sized to its pane on startup, and re-sized whenever the host terminal changes size or the view mode flips between single and grid. In grid mode every visible agent is sized to one cell (`(avail_cols / grid_cols) × (avail_rows / grid_rows)`), so child TUIs render smaller — flip back to single-pane (`g`) for full size.

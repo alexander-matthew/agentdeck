@@ -1,9 +1,9 @@
 # agentdeck
 
-A small Rust TUI that wraps multiple AI-agent CLIs (Claude Code, Codex CLI, Gemini CLI, …) in a single split-pane view. The deck on the left is always visible; the focused agent fills the rest of the screen and you type into it the same way you'd type into the CLI on its own.
+A small Rust TUI that wraps multiple AI-agent CLIs (Claude Code, Codex CLI, Gemini CLI, Aider, …) in a single split-pane view. The deck on the left is always visible; the right pane shows the focused agent (or a grid of agents, or a usage dashboard) and you type into it the same way you'd type into the CLI on its own.
 
 ```
- agentdeck   focus: agent   [4 agents]    F1 to toggle focus
+ agentdeck   focus: agent   [4 agents]    Ctrl-Space to toggle focus
 ┌─ agents ─────────────────────────┐┌─ Claude · running · waiting ─────────┐
 │ claude (2)                        ││ > write me a small fn that…          │
 │  1 ● Claude              waiting  ││ Sure — here's a sketch:              │
@@ -13,12 +13,20 @@ A small Rust TUI that wraps multiple AI-agent CLIs (Claude Code, Codex CLI, Gemi
 │ gemini (1)                        ││                                      │
 │  4 ● Gemini              idle     ││                                      │
 └───────────────────────────────────┘└──────────────────────────────────────┘
- typing → focused agent   F1 → deck   Ctrl-C → interrupt agent
+ typing → focused agent   Ctrl-Space → deck   Ctrl-C → interrupt agent   [single]
 ```
 
-Default focus is the agent — every keystroke goes straight to it, including `Enter`, arrows, `Ctrl-C`, `Tab`, etc. The one key agentdeck reserves for itself is **F1**, which toggles focus between the agent and the deck. None of the supported agent CLIs bind F1, so this is the safest "always free" key.
+Default focus is the agent — every keystroke goes straight to it, including `Enter`, arrows, `Ctrl-C`, `Tab`, etc. The one key agentdeck reserves for itself is **Ctrl-Space**, which toggles focus between the agent and the deck. None of the supported agent CLIs bind Ctrl-Space, and unlike `Cmd-Tab` / `Super-Tab` no OS or window manager grabs it first. Rebind via `[settings] toggle_key` in the config — see the [configuration reference](docs/configuration.md) for syntax.
 
-When the deck has focus you can navigate with `↑/↓`, jump with `1`–`9`, spawn another agent under the highlighted provider with `a`, kill one with `x`, and quit with `q`. `Enter` (or any digit) returns focus to that agent.
+When the deck has focus you can navigate with `↑`/`↓`, jump with `1`–`9`, `Tab` to the next agent that's waiting on you, spawn another agent under the highlighted provider with `a`, kill one with `x`, rename one with `r`, flip into a grid of panes with `g`, open the centralized usage dashboard with `u`, and quit with `q`. `Enter` (or any digit) returns focus to that agent. Clicking an agent row in the sidebar also selects and focuses it.
+
+### Grid view
+
+Press `g` (in deck focus) to tile the visible agents into a `grid_rows × grid_cols` mosaic — handy when you want to babysit several CLIs at once on a full-screen terminal. The sidebar stays in place. The currently selected agent's cell is the input target (green border + cursor); the others render read-only previews driven by the same vt100 parsers. `g` again returns to single-pane mode. Page-through is automatic: selecting an agent that lives on a different page scrolls the grid to it.
+
+### Usage dashboard
+
+Press `u` (in deck focus) to replace the right pane with a per-provider usage view. agentdeck runs the shell command you've configured under `[usage_commands]` for each provider on a `usage_refresh_secs` cadence, captures stdout, and shows the result as a card. Defaults seed `claude = "npx -y ccusage@latest --json"`. Inside the dashboard, `r` forces a refresh; `u` or `Esc` closes.
 
 ## Why this exists
 
@@ -72,7 +80,7 @@ After that, `agentdeck` is just one word, the same as `claude` or `codex`.
 agentdeck
 ```
 
-On first launch, agentdeck writes a default config to `~/.config/agentdeck/config.toml` with profiles for `claude`, `codex`, and `gemini`. Edit it, then re-run. To inspect what config it would use:
+On first launch, agentdeck writes a default config to `~/.config/agentdeck/config.toml` with profiles for `claude`, `codex`, `gemini`, and `aider`. Edit it, then re-run. To inspect what config it would use:
 
 ```sh
 agentdeck --print-config
@@ -82,8 +90,17 @@ agentdeck --print-config
 
 ```toml
 [settings]
-prefix_byte  = 1     # 0x01 = Ctrl-A. Set to 2 for Ctrl-B (tmux-style).
-detach_key   = "d"
+toggle_key         = "ctrl-space"  # key that swaps focus between deck and agent
+grid_rows          = 2      # rows in the multi-pane grid view (`g`)
+grid_cols          = 2      # cols in the multi-pane grid view (`g`)
+usage_refresh_secs = 60     # how often to re-run [usage_commands] entries
+
+[usage_commands]
+# Shell commands the usage dashboard runs periodically. Keys are provider tags;
+# missing/empty entries skip that provider. Output is captured and shown as a card.
+claude = "npx -y ccusage@latest --json"
+# codex = "your-codex-usage-script"
+# gemini = "your-gemini-usage-script"
 
 [[agent]]
 id        = "claude-main"
@@ -117,7 +134,7 @@ You can run **multiple instances of the same provider** by giving each its own `
 
 ## Keys
 
-The only key agentdeck reserves globally is **F1**, which swaps focus between the agent pane and the deck sidebar. Everything else depends on which pane has focus.
+The only key agentdeck reserves globally is **Ctrl-Space** (configurable via `[settings] toggle_key`), which swaps focus between the agent pane and the deck sidebar. Everything else depends on which pane has focus.
 
 ### Focus = agent (default)
 
@@ -126,7 +143,7 @@ All keystrokes are forwarded to the focused agent's PTY (chars, arrows, F2–F12
 | Key | Action |
 | --- | --- |
 | anything | sent to the focused agent |
-| `F1` | swap focus to the deck |
+| `Ctrl-Space` | swap focus to the deck |
 
 ### Focus = deck
 
@@ -135,10 +152,16 @@ All keystrokes are forwarded to the focused agent's PTY (chars, arrows, F2–F12
 | `↑` / `k`, `↓` / `j` | move cursor (skips provider headings) |
 | `1`–`9` | jump to that agent and return focus to it |
 | `Enter` | return focus to the highlighted agent |
+| `Tab` | jump to the next agent in the `waiting` state and focus it |
+| mouse click | select and focus the clicked agent in the sidebar |
 | `a` or `+` | spawn another agent under the highlighted agent's provider (ephemeral cwd prompt) |
 | `x` | kill and remove the highlighted agent |
+| `r` | rename the highlighted agent (ephemeral; not written back to config) |
+| `o` | cycle sort mode (provider, status, created) |
+| `g` | toggle multi-pane grid view (uses `[settings]` `grid_rows`/`grid_cols`) |
+| `u` | open the centralized usage dashboard |
 | `q`, `Ctrl-C` | quit (kills all child agents) |
-| `F1` | swap focus back to the agent |
+| `Ctrl-Space` | swap focus back to the agent |
 
 ### Adding (cwd prompt)
 
@@ -149,6 +172,24 @@ All keystrokes are forwarded to the focused agent's PTY (chars, arrows, F2–F12
 | `Backspace` | delete char left of cursor |
 | `Enter` | spawn the new agent with this cwd |
 | `Esc` or `Ctrl-C` | cancel |
+
+### Renaming
+
+| Key | Action |
+| --- | --- |
+| typing | edit the agent's display name |
+| `←` / `→`, `Home` / `End` | move cursor in the field |
+| `Backspace` | delete char left of cursor |
+| `Enter` | save the new name (ephemeral — re-edit `config.toml` to persist) |
+| `Esc` | cancel |
+
+### Usage dashboard (`u`)
+
+| Key | Action |
+| --- | --- |
+| `r` | force-refresh every configured `[usage_commands]` entry now |
+| `u` or `Esc` | close the dashboard, return to the previous view |
+| `q`, `Ctrl-C` | quit |
 
 ## Status badges
 
@@ -168,8 +209,11 @@ Detection uses small provider-specific patterns (see `src/state.rs`). When a CLI
 
 ## Design notes
 
-- **One PTY per agent.** Each child process gets a real pseudo-terminal, so its full-screen UI (alt screen, cursor moves, colors, mouse) renders normally on attach.
-- **vt100 parser per agent** for the preview pane — we don't try to repaint the agent through ratatui when you're attached; the bytes go straight to your real terminal.
+- **One PTY per agent.** Each child process gets a real pseudo-terminal, so its full-screen UI (alt screen, cursor moves, colors, mouse) renders normally inside the pane.
+- **vt100 parser per agent.** Every agent's bytes are fed into its own `vt100::Parser`. The right pane (single, grid, or usage dashboard) reads from those parsers and re-renders cells as styled ratatui spans, so the deck and the agent share one source of truth.
+- **Grid view resizes PTYs.** Flipping into grid mode (`g`) recomputes each agent's PTY dimensions to its cell size and calls `master.resize` + `parser.set_size`, so child TUIs redraw to fit. Flipping back resizes them to the single-pane size.
+- **Usage dashboard runs untrusted shell commands.** Each `[usage_commands]` entry is executed as `sh -c <command>` in a background thread, with a 20 s timeout and a 64 KB output cap. Commands run under your user — treat the config file as you'd treat your shell's `.profile`.
+- **Smart Focus.** If the current agent is `idle` and another agent transitions to `waiting`, focus will automatically jump to the waiting agent as long as you haven't typed for at least 2 seconds. Use `Tab` in the sidebar to manually cycle through waiting agents.
 - **No shared context.** agentdeck itself doesn't run an LLM, doesn't keep a transcript, doesn't summarize anything. Each agent's conversation history lives entirely inside that agent's own process.
 - **Logs** go to `~/.local/state/agentdeck/agentdeck.log` so they never collide with the TUI. Tail with `tail -f ~/.local/state/agentdeck/agentdeck.log`. Set `AGENTDECK_LOG=debug` for verbose output.
 

@@ -125,7 +125,7 @@ fn provider_awaiting_input(provider: Provider, parser: &vt100::Parser) -> bool {
         Provider::Codex => codex_awaiting_input(parser),
         Provider::Gemini => gemini_awaiting_input(parser),
         Provider::Aider => aider_awaiting_input(parser),
-        Provider::Other => generic_awaiting_input(parser),
+        Provider::Shell | Provider::Other => generic_awaiting_input(parser),
     }
 }
 
@@ -274,6 +274,7 @@ mod tests {
             provider,
             status: Status::Running,
             parser: vt100::Parser::new(24, 80, 1000),
+            scroll_offset: 0,
             template: cfg,
             cwd_label: None,
             spawned_at: now - Duration::from_secs(10),

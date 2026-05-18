@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
+- **Multi-pane grid view.** Press `g` (in deck focus) to tile visible agents into a `grid_rows × grid_cols` mosaic; the sidebar stays in place. The selected agent's cell is the input target (green border + cursor), others render as live read-only previews. PTYs resize to each cell on view-mode toggle. Grid dimensions are configurable via new `[settings] grid_rows` / `grid_cols` (defaults 2 × 2). Selecting an agent on another page auto-scrolls the grid.
+- **Centralized usage dashboard.** Press `u` (in deck focus) to replace the right pane with one card per provider. agentdeck runs the shell command you've configured under `[usage_commands]` for each provider on a `usage_refresh_secs` cadence (default 60 s, clamped to ≥ 5 s) and shows the output. Default seeds `claude = "npx -y ccusage@latest --json"`. Inside the dashboard, `r` forces refresh, `u` / `Esc` closes.
+- **`src/usage.rs`**: new module for the background poller. Each refresh runs as `sh -c <command>` in its own short-lived thread with a 20 s timeout and a 64 KB output cap; results are routed to the main loop over a crossbeam channel.
+- New `[usage_commands]` table: per-provider shell commands the dashboard runs. Empty / missing entries skip that provider.
+- New `[settings]` fields: `grid_rows`, `grid_cols`, `usage_refresh_secs`.
+- `r` from deck focus opens an ephemeral rename modal for the highlighted agent. Edits live until quit; not written back to the config.
+- `Provider::Aider` and `Provider::Shell` recognized as first-class providers, with awaiting-input heuristics in `src/state.rs`.
+
+### Changed
+- **Default `toggle_key` changed from `F1` to `Ctrl-Space`.** Easier to reach on most keyboards, and unlike `Cmd-Tab` / `Super-Tab` it isn't grabbed by the OS or window manager. F1 still works if you set `toggle_key = "f1"` in `[settings]`. Both the fallback path in `keymap::map_deck_key` (when the configured key fails to parse) and the agent-focus toggle check in `app.rs` were updated to match the new default.
+- `render_agent_pane` refactored into a per-cell helper (`render_agent_cell`) so the new grid view can share the same vt100→ratatui rendering path.
+- Fixed a pre-existing compile error in `row_to_line`'s scrollback branch — vt100 0.15 doesn't expose scrollback rows cell-by-cell, so rows below row 0 now render blank rather than failing to build. The "scrolled up N" indicator in the pane title still tells the user they've scrolled past the visible region.
+
+## [Unreleased — earlier in development cycle]
+
+### Added
 - Initial documentation set: `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`, `docs/configuration.md`, `docs/providers.md`, `docs/architecture.md`, PR template.
 - Provider-grouped overview list with non-selectable section headings. Navigation skips headings; number-key bindings index selectable rows top-to-bottom.
 - Live status badges per agent (`starting` / `working` / `thinking` / `idle` / `waiting` / `stuck` / `exited`). Combines activity timestamps with provider-specific terminal-output heuristics (`src/state.rs`).

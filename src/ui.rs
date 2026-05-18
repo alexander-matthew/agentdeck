@@ -9,11 +9,20 @@ use ratatui::{
 use crate::agent::{Agent, Status};
 use crate::config::Provider;
 use crate::state::{self, LiveState};
+use crate::usage::UsageState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Deck,
     Agent,
+}
+
+/// Layout of the right-hand pane area: a single full-size agent (the
+/// historical default) or a grid of agent cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Single,
+    Grid,
 }
 
 /// One displayable row in the sidebar.
@@ -29,49 +38,97 @@ pub struct RowModel {
     pub selectable: Vec<usize>,
 }
 
-pub fn build_rows(agents: &[Agent]) -> RowModel {
-    let order = [
-        Provider::Claude,
-        Provider::Codex,
-        Provider::Gemini,
-        Provider::Aider,
-        Provider::Other,
-    ];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    Provider,
+    Status,
+    Created,
+}
+
+pub fn build_rows(agents: &[Agent], sort: SortMode) -> RowModel {
     let mut rows: Vec<Row> = Vec::new();
     let mut selectable: Vec<usize> = Vec::new();
-    for p in order {
-        let group: Vec<usize> = agents
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.provider == p)
-            .map(|(i, _)| i)
-            .collect();
-        if group.is_empty() {
-            continue;
+
+    match sort {
+        SortMode::Provider => {
+            let order = [
+                Provider::Claude,
+                Provider::Codex,
+                Provider::Gemini,
+                Provider::Aider,
+                Provider::Shell,
+                Provider::Other,
+            ];
+            for p in order {
+                let group: Vec<usize> = agents
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.provider == p)
+                    .map(|(i, _)| i)
+                    .collect();
+                if group.is_empty() {
+                    continue;
+                }
+                rows.push(Row::Header(p, group.len()));
+                for ai in group {
+                    selectable.push(rows.len());
+                    rows.push(Row::Agent(ai));
+                }
+            }
         }
-        rows.push(Row::Header(p, group.len()));
-        for ai in group {
-            selectable.push(rows.len());
-            rows.push(Row::Agent(ai));
+        SortMode::Status => {
+            // Sort agents by status, but keep original indices for Row::Agent
+            let mut indices: Vec<usize> = (0..agents.len()).collect();
+            indices.sort_by_key(|&i| match agents[i].status {
+                Status::Running => 0,
+                Status::Exited(_) => 1,
+                Status::SpawnFailed => 2,
+            });
+            for ai in indices {
+                selectable.push(rows.len());
+                rows.push(Row::Agent(ai));
+            }
+        }
+        SortMode::Created => {
+            let mut indices: Vec<usize> = (0..agents.len()).collect();
+            indices.sort_by_key(|&i| agents[i].spawned_at);
+            for ai in indices {
+                selectable.push(rows.len());
+                rows.push(Row::Agent(ai));
+            }
         }
     }
     RowModel { rows, selectable }
 }
 
 pub struct AddModalState<'a> {
-    pub provider: Provider,
+    pub providers: &'a [Provider],
+    pub selected_provider: usize,
     pub cwd: &'a str,
     pub cursor: usize,
 }
 
+pub struct RenameModalState<'a> {
+    pub name: &'a str,
+    pub cursor: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn draw_main(
     f: &mut Frame,
     agents: &[Agent],
     model: &RowModel,
     selected_in_selectable: usize,
     focus: Focus,
+    view_mode: ViewMode,
+    grid_dims: (u16, u16),
+    visible_agents: &[usize],
+    showing_usage: bool,
+    usage_state: &UsageState,
     footer: &str,
     modal: Option<AddModalState>,
+    rename_modal: Option<RenameModalState>,
+    tk_label: &str,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -83,9 +140,9 @@ pub fn draw_main(
         .split(f.area());
 
     // Top status bar.
-    f.render_widget(header_widget(agents.len(), focus), chunks[0]);
+    f.render_widget(header_widget(agents.len(), focus, tk_label), chunks[0]);
 
-    // Sidebar + agent pane.
+    // Sidebar + main pane.
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(36), Constraint::Min(0)])
@@ -93,15 +150,35 @@ pub fn draw_main(
 
     render_sidebar(f, agents, model, selected_in_selectable, focus, body[0]);
 
-    let focused_agent =
-        model
-            .selectable
-            .get(selected_in_selectable)
-            .and_then(|&row_idx| match model.rows.get(row_idx) {
-                Some(Row::Agent(ai)) => agents.get(*ai),
-                _ => None,
-            });
-    render_agent_pane(f, focused_agent, focus, body[1]);
+    let focused_agent_idx = model
+        .selectable
+        .get(selected_in_selectable)
+        .and_then(|&row_idx| match model.rows.get(row_idx) {
+            Some(Row::Agent(ai)) => Some(*ai),
+            _ => None,
+        });
+
+    if showing_usage {
+        render_usage_pane(f, usage_state, body[1]);
+    } else {
+        match view_mode {
+            ViewMode::Single => {
+                let focused_agent = focused_agent_idx.and_then(|i| agents.get(i));
+                render_agent_pane(f, focused_agent, focus, body[1]);
+            }
+            ViewMode::Grid => {
+                render_agent_grid(
+                    f,
+                    agents,
+                    visible_agents,
+                    focused_agent_idx,
+                    focus,
+                    grid_dims,
+                    body[1],
+                );
+            }
+        }
+    }
 
     // Bottom hint bar.
     f.render_widget(
@@ -115,9 +192,12 @@ pub fn draw_main(
     if let Some(m) = modal {
         render_add_modal(f, m);
     }
+    if let Some(m) = rename_modal {
+        render_rename_modal(f, m);
+    }
 }
 
-fn header_widget(n_agents: usize, focus: Focus) -> Paragraph<'static> {
+fn header_widget(n_agents: usize, focus: Focus, tk_label: &str) -> Paragraph<'static> {
     let focus_chip = match focus {
         Focus::Deck => Span::styled(
             " focus: deck ",
@@ -149,7 +229,7 @@ fn header_widget(n_agents: usize, focus: Focus) -> Paragraph<'static> {
             format!("[{n_agents} agents]"),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::raw("   F1 to toggle focus "),
+        Span::raw(format!("   {} to toggle focus ", tk_label)),
     ]))
 }
 
@@ -262,7 +342,14 @@ fn state_color(live: LiveState) -> Style {
 }
 
 fn render_agent_pane(f: &mut Frame, agent: Option<&Agent>, focus: Focus, area: Rect) {
-    let border_style = if focus == Focus::Agent {
+    let is_input_target = focus == Focus::Agent;
+    render_agent_cell(f, agent, is_input_target, area);
+}
+
+/// Render a single agent into `area`. `is_input_target` controls border color
+/// (green vs dark) and whether the terminal cursor gets parked in this cell.
+fn render_agent_cell(f: &mut Frame, agent: Option<&Agent>, is_input_target: bool, area: Rect) {
+    let border_style = if is_input_target {
         Style::default().fg(Color::Green)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -270,7 +357,11 @@ fn render_agent_pane(f: &mut Frame, agent: Option<&Agent>, focus: Focus, area: R
     let title = match agent {
         Some(a) => {
             let live = state::detect(a);
-            format!(" {} · {} · {} ", a.name, a.status.label(), live.short())
+            let mut label = format!(" {} · {} · {} ", a.name, a.status.label(), live.short());
+            if a.scroll_offset > 0 {
+                label.push_str(&format!(" [scrolled up {}] ", a.scroll_offset));
+            }
+            label
         }
         None => " no agent ".into(),
     };
@@ -284,28 +375,188 @@ fn render_agent_pane(f: &mut Frame, agent: Option<&Agent>, focus: Focus, area: R
     let Some(agent) = agent else { return };
     let screen = agent.parser.screen();
     let (grid_rows, grid_cols) = screen.size();
+
     let view_rows = inner.height.min(grid_rows);
     let view_cols = inner.width.min(grid_cols);
-    let start_row = grid_rows.saturating_sub(view_rows);
+
+    let scrollback_rows = screen.scrollback() as i32;
+    let effective_offset = agent.scroll_offset.min(scrollback_rows as u16);
+
+    let total_rows = scrollback_rows + (grid_rows as i32);
+    let end_row = total_rows - (effective_offset as i32);
+    let start_row = (end_row - (view_rows as i32)).max(0);
 
     let mut lines: Vec<Line> = Vec::with_capacity(view_rows as usize);
-    for r in start_row..(start_row + view_rows) {
+    for r in start_row..end_row {
         lines.push(row_to_line(screen, r, view_cols));
     }
     f.render_widget(Paragraph::new(lines), inner);
 
-    // Position the visible cursor at the agent's cursor (subject to view clipping).
-    if focus == Focus::Agent {
+    if is_input_target && agent.scroll_offset == 0 {
         let (cur_row, cur_col) = screen.cursor_position();
-        if cur_row >= start_row && cur_row < start_row + view_rows && cur_col < view_cols {
+        if cur_row < view_rows && cur_col < view_cols {
             let x = inner.x + cur_col;
-            let y = inner.y + (cur_row - start_row);
+            let y = inner.y + cur_row;
             f.set_cursor_position(Position { x, y });
         }
     }
 }
 
-fn row_to_line(screen: &vt100::Screen, row: u16, cols: u16) -> Line<'static> {
+/// Render up to `grid_dims.0 * grid_dims.1` agents into a grid of cells.
+/// `focused_agent_idx` is the input target — that cell gets the highlighted
+/// border and the terminal cursor.
+fn render_agent_grid(
+    f: &mut Frame,
+    agents: &[Agent],
+    visible: &[usize],
+    focused_agent_idx: Option<usize>,
+    focus: Focus,
+    grid_dims: (u16, u16),
+    area: Rect,
+) {
+    let (rows, cols) = (grid_dims.0.max(1), grid_dims.1.max(1));
+
+    let row_constraints: Vec<Constraint> = (0..rows)
+        .map(|_| Constraint::Ratio(1, rows as u32))
+        .collect();
+    let row_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(row_constraints)
+        .split(area);
+
+    let col_constraints: Vec<Constraint> = (0..cols)
+        .map(|_| Constraint::Ratio(1, cols as u32))
+        .collect();
+
+    for r in 0..rows {
+        let cells = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(col_constraints.clone())
+            .split(row_areas[r as usize]);
+        for c in 0..cols {
+            let cell_idx = (r as usize) * (cols as usize) + c as usize;
+            let cell_area = cells[c as usize];
+            let agent = visible.get(cell_idx).and_then(|&ai| agents.get(ai));
+            let is_target = match (focused_agent_idx, visible.get(cell_idx)) {
+                (Some(fi), Some(&ai)) => fi == ai && focus == Focus::Agent,
+                _ => false,
+            };
+            render_agent_cell(f, agent, is_target, cell_area);
+        }
+    }
+}
+
+/// Render the centralized usage dashboard as a stack of provider cards.
+fn render_usage_pane(f: &mut Frame, usage: &UsageState, area: Rect) {
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " usage · subscriptions ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    if usage.is_empty() {
+        let hint = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No usage commands configured.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Add entries under [usage_commands] in your config, e.g.:",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "      claude = \"npx -y ccusage@latest --json\"",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "      codex  = \"my-codex-usage-script\"",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+        f.render_widget(hint, inner);
+        return;
+    }
+
+    let n = usage.entries.len() as u32;
+    let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Ratio(1, n.max(1))).collect();
+    let card_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    for (i, (_, entry)) in usage.entries.iter().enumerate() {
+        let title = if entry.refreshing {
+            format!(" {} · refreshing… ", entry.provider)
+        } else {
+            match entry.last_run_at {
+                Some(t) => format!(" {} · {} ago ", entry.provider, ago(t.elapsed())),
+                None => format!(" {} · never run ", entry.provider),
+            }
+        };
+        let border = if entry.last_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border)
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let card_inner = block.inner(card_areas[i]);
+        f.render_widget(block, card_areas[i]);
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!("  $ {}", entry.command),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        if let Some(err) = &entry.last_error {
+            lines.push(Line::from(Span::styled(
+                format!("  ! {}", err),
+                Style::default().fg(Color::Red),
+            )));
+            lines.push(Line::from(""));
+        }
+        if let Some(out) = &entry.last_output {
+            for raw in out.lines() {
+                lines.push(Line::from(Span::raw(format!("  {raw}"))));
+            }
+        } else if entry.last_error.is_none() {
+            lines.push(Line::from(Span::styled(
+                "  (waiting for first run)",
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), card_inner);
+    }
+}
+
+fn ago(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn row_to_line(screen: &vt100::Screen, row: i32, cols: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut run_style: Option<Style> = None;
     let mut run_text = String::new();
@@ -320,22 +571,22 @@ fn row_to_line(screen: &vt100::Screen, row: u16, cols: u16) -> Line<'static> {
     };
 
     for c in 0..cols {
-        let Some(cell) = screen.cell(row, c) else {
+        let Some(cell) = screen.cell(row as u16, c) else {
             flush(&mut spans, run_style, &mut run_text);
             run_style = None;
             continue;
         };
         let contents = cell.contents();
-        if contents.is_empty() {
-            run_text.push(' ');
-            continue;
-        }
         let style = cell_to_style(cell);
         if run_style != Some(style) {
             flush(&mut spans, run_style, &mut run_text);
             run_style = Some(style);
         }
-        run_text.push_str(&contents);
+        if contents.is_empty() {
+            run_text.push(' ');
+        } else {
+            run_text.push_str(&contents);
+        }
     }
     flush(&mut spans, run_style, &mut run_text);
     Line::from(spans)
@@ -395,7 +646,7 @@ fn vt_color_to_ratatui(c: vt100::Color) -> Option<Color> {
 fn render_add_modal(f: &mut Frame, m: AddModalState) {
     let area = f.area();
     let width = area.width.clamp(40, 72);
-    let height = 7u16;
+    let height = 11u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let rect = Rect {
@@ -407,7 +658,7 @@ fn render_add_modal(f: &mut Frame, m: AddModalState) {
 
     f.render_widget(Clear, rect);
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        format!(" add {} agent ", m.provider.tag()),
+        " add agent ",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -419,16 +670,35 @@ fn render_add_modal(f: &mut Frame, m: AddModalState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1), // Provider selector
             Constraint::Length(1),
+            Constraint::Length(1), // CWD label
+            Constraint::Length(1), // CWD field
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // Hints
             Constraint::Min(0),
         ])
         .split(inner);
 
+    // Provider selection
+    let mut provider_spans = vec![Span::raw(" variety: ")];
+    for (i, p) in m.providers.iter().enumerate() {
+        let style = if i == m.selected_provider {
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        provider_spans.push(Span::styled(format!(" {} ", p.tag()), style));
+        provider_spans.push(Span::raw(" "));
+    }
+    f.render_widget(Paragraph::new(Line::from(provider_spans)), layout[1]);
+
     f.render_widget(
-        Paragraph::new(Span::raw("Working directory for the new agent:")),
-        layout[0],
+        Paragraph::new(Span::raw(" Working directory for the new agent:")),
+        layout[3],
     );
 
     let split = m.cursor.min(m.cwd.chars().count());
@@ -445,11 +715,75 @@ fn render_add_modal(f: &mut Frame, m: AddModalState) {
         ),
         Span::raw(right),
     ]);
+    f.render_widget(Paragraph::new(field), layout[4]);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " ←/→: variety   Tab: switch field   Enter: spawn   Esc: cancel ",
+            Style::default().fg(Color::DarkGray),
+        )),
+        layout[6],
+    );
+}
+
+fn render_rename_modal(f: &mut Frame, m: RenameModalState) {
+    let area = f.area();
+    let width = area.width.clamp(40, 60);
+    let height = 7u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " rename session ",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1), // Prompt
+            Constraint::Length(1), // Field
+            Constraint::Length(1), // Hints
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::raw(" Enter a new name for this session:")),
+        layout[1],
+    );
+
+    let split = m.cursor.min(m.name.chars().count());
+    let left: String = m.name.chars().take(split).collect();
+    let right: String = m.name.chars().skip(split).collect();
+    let field = Line::from(vec![
+        Span::raw(" name: "),
+        Span::raw(left),
+        Span::styled(
+            "│",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::SLOW_BLINK),
+        ),
+        Span::raw(right),
+    ]);
     f.render_widget(Paragraph::new(field), layout[2]);
 
     f.render_widget(
         Paragraph::new(Span::styled(
-            " Enter: spawn   Esc: cancel ",
+            " Enter: save   Esc: cancel ",
             Style::default().fg(Color::DarkGray),
         )),
         layout[3],
@@ -487,10 +821,29 @@ mod tests {
             mock_agent(Provider::Claude, "alpha"),
             mock_agent(Provider::Codex, "bravo"),
         ];
-        let model = build_rows(&agents);
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
         let mut term = Terminal::new(TestBackend::new(80, 24)).expect("backend");
-        term.draw(|f| draw_main(f, &agents, &model, 0, Focus::Deck, " footer ", None))
-            .expect("draw");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (2, 2),
+                &visible,
+                false,
+                &usage,
+                " footer ",
+                None,
+                None,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
 
         let lines = buf_lines(&term);
         assert_eq!(lines.len(), 24);

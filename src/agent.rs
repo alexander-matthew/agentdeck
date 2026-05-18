@@ -19,6 +19,7 @@ pub struct Agent {
     pub status: Status,
 
     pub parser: vt100::Parser,
+    pub scroll_offset: u16,
     /// Source config kept around so we can clone-spawn new instances under the
     /// same provider without going back to disk.
     pub template: AgentConfig,
@@ -137,6 +138,7 @@ impl Agent {
             provider: cfg.provider,
             status: Status::Running,
             parser: vt100::Parser::new(size.rows, size.cols, 1000),
+            scroll_offset: 0,
             template: cfg.clone(),
             cwd_label: cfg.cwd.clone(),
             spawned_at: now,
@@ -193,6 +195,14 @@ impl Agent {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
+
+    pub fn scroll_up(&mut self, n: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(n).min(1000);
+    }
+
+    pub fn scroll_down(&mut self, n: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
 }
 
 #[cfg(test)]
@@ -230,6 +240,7 @@ pub(crate) mod test_helpers {
             provider,
             status: Status::Running,
             parser: vt100::Parser::new(size.rows, size.cols, 1000),
+            scroll_offset: 0,
             template: cfg,
             cwd_label: None,
             spawned_at: past,
