@@ -14,9 +14,9 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{Read, Write, stdout};
 use std::time::{Duration, Instant};
 
-use crate::agent::{Agent, AgentEvent, Status};
-use crate::config::Config;
-use crate::ui::draw_overview;
+use crate::agent::{Agent, AgentEvent, RuntimeId, Status};
+use crate::config::{AgentConfig, Config, Provider};
+use crate::ui::{self, AddModalState, draw_overview};
 
 #[derive(Debug)]
 enum InputEvt {
@@ -25,10 +25,16 @@ enum InputEvt {
     Closed,
 }
 
-#[derive(Debug, Clone, Copy)]
 enum Mode {
     Overview,
-    Attached { idx: usize },
+    Attached {
+        rid: RuntimeId,
+    },
+    Adding {
+        provider: Provider,
+        cwd: String,
+        cursor: usize,
+    },
 }
 
 pub fn run(cfg: Config) -> Result<()> {
@@ -58,23 +64,24 @@ fn run_inner(cfg: Config, stdout_handle: &mut std::io::Stdout) -> Result<()> {
     };
 
     let (agent_tx, agent_rx) = unbounded::<AgentEvent>();
+    let mut next_rid: RuntimeId = 1;
     let mut agents: Vec<Agent> = Vec::with_capacity(cfg.agents.len());
-    for (idx, ac) in cfg.agents.iter().enumerate() {
+    for ac in cfg.agents.iter() {
         if ac.manual {
             tracing::info!(id = %ac.id, "skipping manual agent");
             continue;
         }
-        match Agent::spawn(ac, idx, initial_size, agent_tx.clone()) {
+        let rid = next_rid;
+        next_rid += 1;
+        match Agent::spawn(ac, rid, initial_size, agent_tx.clone()) {
             Ok(a) => agents.push(a),
             Err(e) => {
                 tracing::error!(id = %ac.id, error = ?e, "failed to spawn agent");
-                // Push a placeholder so indices line up with config order? For MVP, skip.
             }
         }
     }
 
     if agents.is_empty() {
-        // Don't leave the user in an empty TUI with no exit hint — bail out with a message.
         execute!(stdout_handle, LeaveAlternateScreen, Show).ok();
         disable_raw_mode().ok();
         eprintln!(
@@ -87,33 +94,31 @@ fn run_inner(cfg: Config, stdout_handle: &mut std::io::Stdout) -> Result<()> {
     let mut mode = Mode::Overview;
     let mut current_term_size = (term_cols, term_rows);
     let mut should_quit = false;
-    let mut footer = " ↑/↓ select   1-9 attach   r restart   k kill   q quit ".to_string();
     let mut last_size_check = Instant::now();
     let prefix = cfg.settings.prefix_byte;
     let detach_byte = cfg.settings.detach_key as u8;
 
-    // Channel used only while attached.
     let mut input_rx: Option<Receiver<InputEvt>> = None;
     let mut input_thread: Option<std::thread::JoinHandle<()>> = None;
 
     while !should_quit {
-        // Drain agent output. In attached mode, write bytes for the focused agent
-        // straight to the host terminal so the native TUI renders unchanged.
+        // Drain PTY output. In attached mode, mirror bytes for the focused agent
+        // straight to the host terminal.
         while let Ok(ev) = agent_rx.try_recv() {
             match ev {
-                AgentEvent::Output { agent_idx, bytes } => {
-                    if let Some(a) = agents.get_mut(agent_idx) {
+                AgentEvent::Output { rid, bytes } => {
+                    if let Some(a) = agents.iter_mut().find(|a| a.rid == rid) {
                         a.feed(&bytes);
                     }
-                    if let Mode::Attached { idx } = mode
-                        && idx == agent_idx
+                    if let Mode::Attached { rid: focused } = mode
+                        && focused == rid
                     {
                         let _ = stdout_handle.write_all(&bytes);
                         let _ = stdout_handle.flush();
                     }
                 }
-                AgentEvent::ReaderClosed { agent_idx } => {
-                    if let Some(a) = agents.get_mut(agent_idx) {
+                AgentEvent::ReaderClosed { rid } => {
+                    if let Some(a) = agents.iter_mut().find(|a| a.rid == rid) {
                         a.poll_exit();
                         if matches!(a.status, Status::Running) {
                             a.status = Status::Exited(0);
@@ -128,33 +133,48 @@ fn run_inner(cfg: Config, stdout_handle: &mut std::io::Stdout) -> Result<()> {
 
         match mode {
             Mode::Overview => {
-                terminal.draw(|f| draw_overview(f, &agents, selected, &footer))?;
+                let model = ui::build_rows(&agents);
+                if !model.selectable.is_empty() {
+                    selected = selected.min(model.selectable.len() - 1);
+                }
+                let footer = " ↑/↓ select   1-9 attach   a add   x remove   q quit ".to_string();
+                terminal.draw(|f| draw_overview(f, &agents, &model, selected, &footer, None))?;
                 if event::poll(Duration::from_millis(50))? {
                     let ev = event::read()?;
-                    if let Some(action) = handle_overview_event(ev, agents.len(), &mut selected) {
+                    let action = handle_overview_event(ev, &model, &mut selected);
+                    if let Some(action) = action {
                         match action {
                             OverviewAction::Quit => should_quit = true,
-                            OverviewAction::Attach(idx) => {
+                            OverviewAction::Attach(ai) => {
+                                let rid = agents[ai].rid;
                                 attach(
                                     stdout_handle,
                                     &mut terminal,
                                     &mut agents,
-                                    idx,
+                                    rid,
                                     prefix,
                                     detach_byte,
                                     &mut input_rx,
                                     &mut input_thread,
                                 )?;
-                                mode = Mode::Attached { idx };
-                                footer = format!(
-                                    " attached · Ctrl-{} {} to detach ",
-                                    char_for_ctrl(prefix),
-                                    cfg.settings.detach_key
-                                );
+                                mode = Mode::Attached { rid };
                             }
-                            OverviewAction::Kill(idx) => {
-                                if let Some(a) = agents.get_mut(idx) {
+                            OverviewAction::Add(ai) => {
+                                let a = &agents[ai];
+                                let cwd = a.cwd_label.clone().unwrap_or_else(|| "~".into());
+                                let cursor = cwd.chars().count();
+                                mode = Mode::Adding {
+                                    provider: a.provider,
+                                    cwd,
+                                    cursor,
+                                };
+                            }
+                            OverviewAction::Remove(ai) => {
+                                if let Some(a) = agents.get_mut(ai) {
                                     a.kill();
+                                }
+                                if ai < agents.len() {
+                                    agents.remove(ai);
                                 }
                             }
                             OverviewAction::Resize(cols, rows) => {
@@ -168,13 +188,57 @@ fn run_inner(cfg: Config, stdout_handle: &mut std::io::Stdout) -> Result<()> {
                     }
                 }
             }
-            Mode::Attached { idx } => {
-                // Pump input events from the dedicated stdin thread.
+            Mode::Adding {
+                ref mut cwd,
+                ref mut cursor,
+                provider,
+            } => {
+                let model = ui::build_rows(&agents);
+                let footer = " Enter: spawn   Esc: cancel ".to_string();
+                let modal = AddModalState {
+                    provider,
+                    cwd: cwd.as_str(),
+                    cursor: *cursor,
+                };
+                terminal
+                    .draw(|f| draw_overview(f, &agents, &model, selected, &footer, Some(modal)))?;
+                if event::poll(Duration::from_millis(50))? {
+                    let ev = event::read()?;
+                    match handle_adding_event(ev, cwd, cursor) {
+                        AddingAction::Spawn => {
+                            let new_cfg = derive_child_config(&agents, provider, cwd, next_rid);
+                            let rid = next_rid;
+                            next_rid += 1;
+                            let pty_size = PtySize {
+                                rows: current_term_size.1.saturating_sub(3).max(10),
+                                cols: current_term_size.0.max(40),
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            };
+                            match Agent::spawn(&new_cfg, rid, pty_size, agent_tx.clone()) {
+                                Ok(a) => {
+                                    tracing::info!(id = %new_cfg.id, "spawned runtime agent");
+                                    agents.push(a);
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = ?e, "failed to spawn runtime agent");
+                                }
+                            }
+                            mode = Mode::Overview;
+                        }
+                        AddingAction::Cancel => {
+                            mode = Mode::Overview;
+                        }
+                        AddingAction::None => {}
+                    }
+                }
+            }
+            Mode::Attached { rid } => {
                 if let Some(rx) = input_rx.as_ref() {
                     while let Ok(evt) = rx.try_recv() {
                         match evt {
                             InputEvt::Bytes(b) => {
-                                if let Some(a) = agents.get_mut(idx) {
+                                if let Some(a) = agents.iter_mut().find(|a| a.rid == rid) {
                                     let _ = a.write(&b);
                                 }
                             }
@@ -186,35 +250,30 @@ fn run_inner(cfg: Config, stdout_handle: &mut std::io::Stdout) -> Result<()> {
                                     &mut input_thread,
                                 )?;
                                 mode = Mode::Overview;
-                                footer = " ↑/↓ select   1-9 attach   r restart   k kill   q quit "
-                                    .to_string();
                                 break;
                             }
                         }
                     }
                 }
 
-                // Forward host-terminal resizes to the PTY by polling size
-                // (we can't drain crossterm events here without stealing stdin bytes).
+                // Forward host-terminal resizes to the PTY by polling size.
                 if last_size_check.elapsed() > Duration::from_millis(200) {
                     if let Ok(sz) = crossterm::terminal::size()
                         && sz != current_term_size
                     {
                         current_term_size = sz;
-                        if let Some(a) = agents.get_mut(idx) {
+                        if let Some(a) = agents.iter_mut().find(|a| a.rid == rid) {
                             a.resize(sz.1, sz.0);
                         }
                     }
                     last_size_check = Instant::now();
                 }
 
-                // Light sleep so we don't pin a core while the agent is idle.
                 std::thread::sleep(Duration::from_millis(8));
             }
         }
     }
 
-    // Clean shutdown: kill all child processes.
     for a in agents.iter_mut() {
         a.kill();
     }
@@ -224,15 +283,27 @@ fn run_inner(cfg: Config, stdout_handle: &mut std::io::Stdout) -> Result<()> {
 enum OverviewAction {
     Quit,
     Attach(usize),
-    Kill(usize),
+    Add(usize),
+    Remove(usize),
     Resize(u16, u16),
 }
 
 fn handle_overview_event(
     ev: Event,
-    n_agents: usize,
+    model: &ui::RowModel,
     selected: &mut usize,
 ) -> Option<OverviewAction> {
+    let n = model.selectable.len();
+    let agent_idx_at_selected = || {
+        model.selectable.get(*selected).and_then(|&row_idx| {
+            if let Some(ui::Row::Agent(ai)) = model.rows.get(row_idx) {
+                Some(*ai)
+            } else {
+                None
+            }
+        })
+    };
+
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
             KeyCode::Char('q') => Some(OverviewAction::Quit),
@@ -240,43 +311,32 @@ fn handle_overview_event(
                 Some(OverviewAction::Quit)
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if n_agents > 0 {
-                    *selected = if *selected == 0 {
-                        n_agents - 1
-                    } else {
-                        *selected - 1
-                    };
+                if n > 0 {
+                    *selected = if *selected == 0 { n - 1 } else { *selected - 1 };
                 }
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if n_agents > 0 {
-                    *selected = (*selected + 1) % n_agents;
+                if n > 0 {
+                    *selected = (*selected + 1) % n;
                 }
                 None
             }
-            KeyCode::Enter => {
-                if n_agents > 0 {
-                    Some(OverviewAction::Attach(*selected))
-                } else {
-                    None
-                }
-            }
+            KeyCode::Enter => agent_idx_at_selected().map(OverviewAction::Attach),
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                let n = (c as u8 - b'1') as usize;
-                if n < n_agents {
-                    Some(OverviewAction::Attach(n))
-                } else {
-                    None
-                }
+                let i = (c as u8 - b'1') as usize;
+                model.selectable.get(i).and_then(|&row_idx| {
+                    if let Some(ui::Row::Agent(ai)) = model.rows.get(row_idx) {
+                        Some(OverviewAction::Attach(*ai))
+                    } else {
+                        None
+                    }
+                })
             }
-            KeyCode::Char('K') => {
-                if n_agents > 0 {
-                    Some(OverviewAction::Kill(*selected))
-                } else {
-                    None
-                }
+            KeyCode::Char('a') | KeyCode::Char('+') => {
+                agent_idx_at_selected().map(OverviewAction::Add)
             }
+            KeyCode::Char('x') => agent_idx_at_selected().map(OverviewAction::Remove),
             _ => None,
         },
         Event::Resize(cols, rows) => Some(OverviewAction::Resize(cols, rows)),
@@ -284,39 +344,153 @@ fn handle_overview_event(
     }
 }
 
+enum AddingAction {
+    None,
+    Spawn,
+    Cancel,
+}
+
+fn handle_adding_event(ev: Event, cwd: &mut String, cursor: &mut usize) -> AddingAction {
+    if let Event::Key(k) = ev
+        && k.kind == KeyEventKind::Press
+    {
+        match k.code {
+            KeyCode::Esc => return AddingAction::Cancel,
+            KeyCode::Enter => return AddingAction::Spawn,
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                return AddingAction::Cancel;
+            }
+            KeyCode::Char(c) => {
+                let idx = byte_index_for_char_cursor(cwd, *cursor);
+                cwd.insert(idx, c);
+                *cursor += 1;
+            }
+            KeyCode::Backspace => {
+                if *cursor > 0 {
+                    let end = byte_index_for_char_cursor(cwd, *cursor);
+                    let start = byte_index_for_char_cursor(cwd, *cursor - 1);
+                    cwd.drain(start..end);
+                    *cursor -= 1;
+                }
+            }
+            KeyCode::Left => {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if *cursor < cwd.chars().count() {
+                    *cursor += 1;
+                }
+            }
+            KeyCode::Home => *cursor = 0,
+            KeyCode::End => *cursor = cwd.chars().count(),
+            _ => {}
+        }
+    }
+    AddingAction::None
+}
+
+fn byte_index_for_char_cursor(s: &str, char_cursor: usize) -> usize {
+    s.char_indices()
+        .nth(char_cursor)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
+/// Build a config for a runtime-spawned agent. Inherits command / args / env from
+/// the most recent existing agent of the same provider (if any) and overrides
+/// the cwd.
+fn derive_child_config(
+    agents: &[Agent],
+    provider: Provider,
+    cwd: &str,
+    rid: RuntimeId,
+) -> AgentConfig {
+    let template = agents
+        .iter()
+        .rev()
+        .find(|a| a.provider == provider)
+        .map(|a| a.template.clone());
+
+    let mut cfg = template.unwrap_or_else(|| AgentConfig {
+        id: format!("{}-{rid}", provider.tag()),
+        name: None,
+        provider,
+        command: provider.tag().to_string(),
+        args: vec![],
+        cwd: None,
+        env: Default::default(),
+        manual: false,
+    });
+
+    let trimmed = cwd.trim();
+    cfg.cwd = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    cfg.id = format!("{}-{rid}", provider.tag());
+    cfg.name = Some(format!(
+        "{} · {}",
+        cfg.name
+            .clone()
+            .unwrap_or_else(|| provider_display(provider).to_string()),
+        short_cwd(trimmed)
+    ));
+    cfg
+}
+
+fn provider_display(p: Provider) -> &'static str {
+    match p {
+        Provider::Claude => "Claude",
+        Provider::Codex => "Codex",
+        Provider::Gemini => "Gemini",
+        Provider::Other => "agent",
+    }
+}
+
+fn short_cwd(cwd: &str) -> String {
+    let home = std::env::var("HOME").ok();
+    let collapsed = match home {
+        Some(h) if cwd.starts_with(&h) => format!("~{}", &cwd[h.len()..]),
+        _ => cwd.to_string(),
+    };
+    let parts: Vec<&str> = collapsed.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return collapsed;
+    }
+    parts[parts.len() - 1].to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attach(
     stdout_handle: &mut std::io::Stdout,
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     agents: &mut [Agent],
-    idx: usize,
+    rid: RuntimeId,
     prefix: u8,
     detach_byte: u8,
     input_rx: &mut Option<Receiver<InputEvt>>,
     input_thread: &mut Option<std::thread::JoinHandle<()>>,
 ) -> Result<()> {
-    // Leave the ratatui alt-screen so the agent's native TUI gets the real terminal.
     execute!(stdout_handle, LeaveAlternateScreen, Show)?;
     execute!(stdout_handle, Clear(ClearType::All), MoveTo(0, 0))?;
 
-    // Repaint the agent's current screen state so the user isn't staring at a blank terminal.
-    if let Some(a) = agents.get(idx) {
+    if let Some(a) = agents.iter().find(|a| a.rid == rid) {
         let snapshot = a.current_screen_bytes();
         stdout_handle.write_all(&snapshot).ok();
         stdout_handle.flush().ok();
     }
 
-    // Spin up a stdin reader thread that drives the detach state machine.
     let (tx, rx) = bounded::<InputEvt>(256);
-    let tx2 = tx.clone();
     let handle = std::thread::Builder::new()
         .name("agentdeck-stdin".into())
-        .spawn(move || stdin_reader(tx2, prefix, detach_byte))
+        .spawn(move || stdin_reader(tx, prefix, detach_byte))
         .context("spawn stdin reader")?;
     *input_rx = Some(rx);
     *input_thread = Some(handle);
 
-    // Tell ratatui its buffer is no longer valid (we're not in alt screen now).
     terminal.clear().ok();
     Ok(())
 }
@@ -328,7 +502,6 @@ fn detach(
     input_thread: &mut Option<std::thread::JoinHandle<()>>,
 ) -> Result<()> {
     *input_rx = None;
-    // The input thread exits on its own after sending Detach/Closed; just drop the handle.
     let _ = input_thread.take();
 
     execute!(stdout_handle, EnterAlternateScreen, Hide)?;
@@ -360,7 +533,6 @@ fn stdin_reader(tx: Sender<InputEvt>, prefix: u8, detach_byte: u8) {
                             let _ = tx.send(InputEvt::Detach);
                             return;
                         } else if b == prefix {
-                            // Ctrl-A Ctrl-A: send literal prefix byte through.
                             out.push(prefix);
                         } else {
                             out.push(prefix);
@@ -382,14 +554,5 @@ fn stdin_reader(tx: Sender<InputEvt>, prefix: u8, detach_byte: u8) {
                 return;
             }
         }
-    }
-}
-
-fn char_for_ctrl(byte: u8) -> char {
-    // 0x01 -> 'A', 0x02 -> 'B', ...
-    if byte < 0x20 {
-        (b'A' + byte - 1) as char
-    } else {
-        '?'
     }
 }

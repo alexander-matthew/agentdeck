@@ -5,6 +5,7 @@ use std::path::PathBuf;
 mod agent;
 mod app;
 mod config;
+mod state;
 mod ui;
 
 #[derive(Parser, Debug)]

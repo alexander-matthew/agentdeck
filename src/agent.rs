@@ -2,18 +2,33 @@ use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::time::Instant;
 
 use crate::config::{AgentConfig, Provider};
 
+/// Stable per-process identifier minted by the app, separate from the user-facing
+/// config `id`. Used as the channel key so events survive agent reordering/removal.
+pub type RuntimeId = u64;
+
 /// One running provider CLI inside its own PTY.
 pub struct Agent {
-    #[allow(dead_code)] // surfaced via logging only
-    pub id: String,
+    /// Stable runtime id minted by the app — unique for the lifetime of the process.
+    pub rid: RuntimeId,
     pub name: String,
     pub provider: Provider,
     pub status: Status,
 
     pub parser: vt100::Parser,
+    /// Source config kept around so we can clone-spawn new instances under the
+    /// same provider without going back to disk.
+    pub template: AgentConfig,
+    pub cwd_label: Option<String>,
+
+    pub spawned_at: Instant,
+    pub last_output_at: Instant,
+    /// Rolling activity window: bytes received since `recent_window_start`.
+    pub recent_bytes: u64,
+    pub recent_window_start: Instant,
 
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -44,15 +59,15 @@ impl Status {
 #[derive(Debug)]
 pub enum AgentEvent {
     /// Bytes read from the agent's PTY master.
-    Output { agent_idx: usize, bytes: Vec<u8> },
+    Output { rid: RuntimeId, bytes: Vec<u8> },
     /// Reader hit EOF (process likely exited).
-    ReaderClosed { agent_idx: usize },
+    ReaderClosed { rid: RuntimeId },
 }
 
 impl Agent {
     pub fn spawn(
         cfg: &AgentConfig,
-        agent_idx: usize,
+        rid: RuntimeId,
         size: PtySize,
         tx: Sender<AgentEvent>,
     ) -> Result<Self> {
@@ -86,19 +101,19 @@ impl Agent {
 
         // Reader thread: forward chunks to the main loop.
         std::thread::Builder::new()
-            .name(format!("agent-reader-{}", cfg.id))
+            .name(format!("agent-reader-{}-{}", cfg.id, rid))
             .spawn(move || {
                 let mut buf = vec![0u8; 8192];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
-                            let _ = tx.send(AgentEvent::ReaderClosed { agent_idx });
+                            let _ = tx.send(AgentEvent::ReaderClosed { rid });
                             break;
                         }
                         Ok(n) => {
                             if tx
                                 .send(AgentEvent::Output {
-                                    agent_idx,
+                                    rid,
                                     bytes: buf[..n].to_vec(),
                                 })
                                 .is_err()
@@ -107,7 +122,7 @@ impl Agent {
                             }
                         }
                         Err(_) => {
-                            let _ = tx.send(AgentEvent::ReaderClosed { agent_idx });
+                            let _ = tx.send(AgentEvent::ReaderClosed { rid });
                             break;
                         }
                     }
@@ -115,12 +130,19 @@ impl Agent {
             })
             .context("spawn reader thread")?;
 
+        let now = Instant::now();
         Ok(Self {
-            id: cfg.id.clone(),
+            rid,
             name: cfg.display_name().to_string(),
             provider: cfg.provider,
             status: Status::Running,
             parser: vt100::Parser::new(size.rows, size.cols, 1000),
+            template: cfg.clone(),
+            cwd_label: cfg.cwd.clone(),
+            spawned_at: now,
+            last_output_at: now,
+            recent_bytes: 0,
+            recent_window_start: now,
             master: pair.master,
             writer,
             child,
@@ -135,6 +157,15 @@ impl Agent {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
+        let now = Instant::now();
+        self.last_output_at = now;
+        // Roll the 500ms activity window forward; we use byte count in that window
+        // to distinguish active streaming from idle prompts in `state::detect`.
+        if now.duration_since(self.recent_window_start) > std::time::Duration::from_millis(500) {
+            self.recent_window_start = now;
+            self.recent_bytes = 0;
+        }
+        self.recent_bytes = self.recent_bytes.saturating_add(bytes.len() as u64);
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
