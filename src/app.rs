@@ -274,10 +274,8 @@ fn handle_deck_key(
         KeyCode::Down | KeyCode::Char('j') if n > 0 => {
             *selected = (*selected + 1) % n;
         }
-        KeyCode::Enter => {
-            if agent_idx_at(*selected).is_some() {
-                *focus = Focus::Agent;
-            }
+        KeyCode::Enter if agent_idx_at(*selected).is_some() => {
+            *focus = Focus::Agent;
         }
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
             let i = (c as u8 - b'1') as usize;
