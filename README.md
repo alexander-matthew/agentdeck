@@ -137,6 +137,15 @@ Change the prefix via `settings.prefix_byte` in the config.
 
 Early. Works for the happy path on Linux. Not yet tested on macOS (the PTY layer is cross-platform via [`portable-pty`](https://docs.rs/portable-pty/), so it should mostly Just Work — PRs welcome). Not Windows.
 
+## Documentation
+
+- [Configuration reference](docs/configuration.md) — every config field, with recipes.
+- [Provider notes](docs/providers.md) — per-provider quirks and subscription caveats.
+- [Architecture](docs/architecture.md) — internals walkthrough for contributors.
+- [Contributing guide](CONTRIBUTING.md) — local dev, CI gate, PR flow.
+- [Security policy](SECURITY.md) — threat model and reporting.
+- [Changelog](CHANGELOG.md).
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.
