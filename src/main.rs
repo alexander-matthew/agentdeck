@@ -1,3 +1,7 @@
+//! Agentdeck: a small Rust TUI that wraps multiple AI-agent CLIs (Claude Code,
+//! Codex CLI, Gemini CLI, Aider, ...) in a single split-pane view, running each
+//! in its own PTY tile so you can drive them side by side.
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
