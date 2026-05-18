@@ -1,16 +1,54 @@
-//! Serialize crossterm `KeyEvent`s back into the byte sequences a child PTY
-//! expects. We use this because in split-view mode the parent process owns the
-//! stdin (via crossterm's event polling) and the focused agent never gets to
-//! read raw bytes directly.
+//! Key mapping and serialization for agentdeck.
 //!
-//! Coverage is "what the common agent CLIs care about": printable chars + Alt-
-//! prefixed chars, every Ctrl-letter, arrow keys, function keys, navigation
-//! cluster, Backspace/Tab/Enter/Esc. Anything not handled returns `None` so the
-//! caller can drop it rather than send garbage.
-//!
-//! Reference for escape sequences: xterm control sequences, ECMA-48.
+//! Includes:
+//! 1. `Action` enum for high-level UI actions in "deck" (sidebar) mode.
+//! 2. `map_deck_key` to translate crossterm events to `Action`.
+//! 3. `key_event_to_bytes` to serialize crossterm events to byte sequences
+//!    for forwarding to child PTYs in "agent" mode.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Quit,
+    MoveUp,
+    MoveDown,
+    FocusAgent,
+    FocusIndex(usize),
+    AddAgent,
+    RemoveAgent,
+    ToggleFocus,
+    None,
+}
+
+pub fn map_deck_key(ev: KeyEvent) -> Action {
+    if ev.kind != KeyEventKind::Press {
+        return Action::None;
+    }
+
+    if ev.code == KeyCode::F(1) {
+        return Action::ToggleFocus;
+    }
+
+    match ev.code {
+        KeyCode::Char('q') => Action::Quit,
+        KeyCode::Char('c') if ev.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+        
+        KeyCode::Up | KeyCode::Char('k') => Action::MoveUp,
+        KeyCode::Down | KeyCode::Char('j') => Action::MoveDown,
+        
+        KeyCode::Enter => Action::FocusAgent,
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let i = (c as u8 - b'1') as usize;
+            Action::FocusIndex(i)
+        }
+        
+        KeyCode::Char('a') | KeyCode::Char('+') => Action::AddAgent,
+        KeyCode::Char('x') => Action::RemoveAgent,
+        
+        _ => Action::None,
+    }
+}
 
 pub fn key_event_to_bytes(ev: &KeyEvent) -> Option<Vec<u8>> {
     let mods = ev.modifiers;
@@ -75,13 +113,11 @@ fn encode_char(c: char, ctrl: bool, alt: bool, _shift: bool) -> Vec<u8> {
     out
 }
 
-/// Arrow keys: CSI A/B/C/D or CSI 1;<mods> A/B/C/D when modifiers are present.
 fn arrow_or_modified(letter: u8, mods: KeyModifiers) -> Vec<u8> {
     let m = modifier_code(mods);
     if m == 1 {
         vec![0x1b, b'[', letter]
     } else {
-        // ESC [ 1 ; <m> <letter>
         let mod_str = format!("{m}");
         let mut out = vec![0x1b, b'[', b'1', b';'];
         out.extend_from_slice(mod_str.as_bytes());
@@ -90,12 +126,10 @@ fn arrow_or_modified(letter: u8, mods: KeyModifiers) -> Vec<u8> {
     }
 }
 
-/// Home/End: CSI H / CSI F (unmodified), or CSI 1;<mods> H/F otherwise.
 fn csi_or_modified(letter: u8, mods: KeyModifiers) -> Vec<u8> {
     arrow_or_modified(letter, mods)
 }
 
-/// Keys that follow the `CSI <n> ~` convention: PageUp/Down/Insert/Delete.
 fn csi_tilde(n: u8, mods: KeyModifiers) -> Vec<u8> {
     let m = modifier_code(mods);
     if m == 1 {
@@ -109,7 +143,6 @@ fn csi_tilde(n: u8, mods: KeyModifiers) -> Vec<u8> {
     }
 }
 
-/// xterm modifier code: shift=1, alt=2, ctrl=4, summed + 1 (so plain = 1).
 fn modifier_code(mods: KeyModifiers) -> u8 {
     let mut m = 0u8;
     if mods.contains(KeyModifiers::SHIFT) {
@@ -125,9 +158,6 @@ fn modifier_code(mods: KeyModifiers) -> u8 {
 }
 
 fn function_key(n: u8) -> Option<Vec<u8>> {
-    // We deliberately do NOT generate F1 — F1 is hijacked by agentdeck as the
-    // focus toggle and never reaches this code path. Including it here would
-    // be dead code that's confusing to read.
     Some(match n {
         2 => b"\x1bOQ".to_vec(),
         3 => b"\x1bOR".to_vec(),

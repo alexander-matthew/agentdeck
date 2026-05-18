@@ -124,8 +124,24 @@ fn provider_awaiting_input(provider: Provider, parser: &vt100::Parser) -> bool {
         Provider::Claude => claude_awaiting_input(parser),
         Provider::Codex => codex_awaiting_input(parser),
         Provider::Gemini => gemini_awaiting_input(parser),
+        Provider::Aider => aider_awaiting_input(parser),
         Provider::Other => generic_awaiting_input(parser),
     }
+}
+
+/// Aider uses a prompt that usually starts with a green `> ` or similar.
+/// We match on a line that starts with `> ` near the bottom.
+fn aider_awaiting_input(parser: &vt100::Parser) -> bool {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    for r in rows.saturating_sub(4)..rows {
+        let line = row_text(screen, r, cols);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("> ") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Claude Code (`@anthropic-ai/claude-code`) parks on a boxed input area with
@@ -141,7 +157,7 @@ fn claude_awaiting_input(parser: &vt100::Parser) -> bool {
     for r in rows.saturating_sub(6)..rows {
         let line = row_text(screen, r, cols);
         let trimmed = line.trim_start();
-        if trimmed.starts_with("│ >") || trimmed.starts_with("│ >") {
+        if trimmed.starts_with("│ >") {
             return true;
         }
         if trimmed.starts_with("╭─") || trimmed.starts_with("╰─") {
@@ -225,3 +241,168 @@ fn row_text(screen: &vt100::Screen, row: u16, cols: u16) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AgentConfig;
+    use portable_pty::PtySize;
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+
+    fn mock_agent(provider: Provider) -> Agent {
+        let cfg = AgentConfig {
+            id: "test".into(),
+            name: None,
+            provider,
+            command: "echo".into(),
+            args: vec![],
+            cwd: None,
+            env: BTreeMap::new(),
+            manual: false,
+        };
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let now = Instant::now();
+        Agent {
+            rid: 1,
+            name: "test".into(),
+            provider,
+            status: Status::Running,
+            parser: vt100::Parser::new(24, 80, 1000),
+            template: cfg,
+            cwd_label: None,
+            spawned_at: now - Duration::from_secs(10),
+            last_output_at: now - Duration::from_secs(10),
+            recent_bytes: 0,
+            recent_window_start: now - Duration::from_secs(10),
+            master: Box::new(MockMaster),
+            writer: Box::new(Vec::new()),
+            child: Box::new(MockChild),
+            size,
+        }
+    }
+
+    struct MockMaster;
+    impl portable_pty::MasterPty for MockMaster {
+        fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+        fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+            Ok(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        }
+        fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn process_group_leader(&self) -> Option<i32> {
+            None
+        }
+        fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockChild;
+    impl portable_pty::ChildKiller for MockChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(MockKiller)
+        }
+    }
+    impl portable_pty::Child for MockChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockKiller;
+    impl portable_pty::ChildKiller for MockKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(MockKiller)
+        }
+    }
+
+    #[test]
+    fn test_detect_idle() {
+        let agent = mock_agent(Provider::Other);
+        assert_eq!(detect(&agent), LiveState::Idle);
+    }
+
+    #[test]
+    fn test_detect_working() {
+        let mut agent = mock_agent(Provider::Other);
+        agent.feed(b"some output");
+        assert_eq!(detect(&agent), LiveState::Working);
+    }
+
+    #[test]
+    fn test_detect_thinking() {
+        let mut agent = mock_agent(Provider::Other);
+        // Put a spinner in the bottom row
+        let spinner = "⠋";
+        let (rows, _cols) = agent.parser.screen().size();
+        let bytes = format!("\x1b[{};1H{}", rows, spinner);
+        agent.feed(bytes.as_bytes());
+        assert_eq!(detect(&agent), LiveState::Thinking);
+    }
+
+    #[test]
+    fn test_claude_waiting() {
+        let mut agent = mock_agent(Provider::Claude);
+        let (rows, _cols) = agent.parser.screen().size();
+        let prompt = "\x1b[H\x1b[J"; // Clear
+        agent.feed(prompt.as_bytes());
+        
+        // Move to bottom area and draw claude prompt
+        let bytes = format!("\x1b[{};1H│ > hello", rows - 1);
+        agent.feed(bytes.as_bytes());
+        
+        // Advance time to pass ACTIVE_WINDOW but stay within IDLE_DEADLINE for Waiting check
+        agent.last_output_at = Instant::now() - Duration::from_secs(5);
+        assert_eq!(detect(&agent), LiveState::Waiting);
+    }
+
+    #[test]
+    fn test_gemini_waiting() {
+        let mut agent = mock_agent(Provider::Gemini);
+        let (rows, _cols) = agent.parser.screen().size();
+        let bytes = format!("\x1b[{};1H> ", rows - 1);
+        agent.feed(bytes.as_bytes());
+        
+        agent.last_output_at = Instant::now() - Duration::from_secs(5);
+        assert_eq!(detect(&agent), LiveState::Waiting);
+    }
+
+    #[test]
+    fn test_stuck() {
+        let mut agent = mock_agent(Provider::Other);
+        agent.last_output_at = Instant::now() - Duration::from_secs(60);
+        assert_eq!(detect(&agent), LiveState::Stuck);
+    }
+}
+

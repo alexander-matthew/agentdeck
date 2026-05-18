@@ -30,11 +30,11 @@ pub struct Agent {
     pub recent_bytes: u64,
     pub recent_window_start: Instant,
 
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub master: Box<dyn MasterPty + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
     #[allow(dead_code)] // tracked for future resize diff logic
-    size: PtySize,
+    pub size: PtySize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

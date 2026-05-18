@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyEvent, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -13,13 +13,11 @@ use std::time::Duration;
 
 use crate::agent::{Agent, AgentEvent, RuntimeId, Status};
 use crate::config::{AgentConfig, Config, Provider};
-use crate::keymap::key_event_to_bytes;
+use crate::keymap::{self, Action};
 use crate::ui::{self, AddModalState, Focus, draw_main};
 
 const SIDEBAR_WIDTH: u16 = 36;
 
-/// Agent-pane dimensions derived from the terminal size. Used to keep every
-/// PTY sized to the area where it will render.
 struct PaneSize {
     rows: u16,
     cols: u16,
@@ -42,119 +40,13 @@ pub fn run(cfg: Config) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout_handle, EnterAlternateScreen, Hide).context("enter alt screen")?;
 
-    let result = run_inner(cfg);
+    let mut app = App::new(cfg)?;
+    let result = app.run_loop();
 
     execute!(stdout_handle, LeaveAlternateScreen, Show).ok();
     disable_raw_mode().ok();
 
     result
-}
-
-fn run_inner(cfg: Config) -> Result<()> {
-    let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend).context("new terminal")?;
-
-    let (term_cols, term_rows) = crossterm::terminal::size().context("query terminal size")?;
-    let pane = agent_pane_size(term_cols, term_rows);
-    let initial_size = PtySize {
-        rows: pane.rows,
-        cols: pane.cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-
-    let (agent_tx, agent_rx) = unbounded::<AgentEvent>();
-    let mut next_rid: RuntimeId = 1;
-    let mut agents: Vec<Agent> = Vec::with_capacity(cfg.agents.len());
-    for ac in cfg.agents.iter() {
-        if ac.manual {
-            tracing::info!(id = %ac.id, "skipping manual agent");
-            continue;
-        }
-        let rid = next_rid;
-        next_rid += 1;
-        match Agent::spawn(ac, rid, initial_size, agent_tx.clone()) {
-            Ok(a) => agents.push(a),
-            Err(e) => {
-                tracing::error!(id = %ac.id, error = ?e, "failed to spawn agent");
-            }
-        }
-    }
-
-    if agents.is_empty() {
-        // Tear down the screen ourselves so the message lands on the real terminal.
-        execute!(stdout(), LeaveAlternateScreen, Show).ok();
-        disable_raw_mode().ok();
-        eprintln!(
-            "agentdeck: no agents could be spawned. Check your config (run `agentdeck --print-config`)."
-        );
-        return Ok(());
-    }
-
-    let mut selected: usize = 0;
-    let mut focus = Focus::Agent;
-    let mut adding: Option<AddingState> = None;
-    let mut should_quit = false;
-    let mut last_pane_dims = (pane.cols, pane.rows);
-
-    while !should_quit {
-        // Drain PTY output -> feed every agent's vt100 parser. Nothing is
-        // written directly to stdout — the agent's grid renders through our UI.
-        while let Ok(ev) = agent_rx.try_recv() {
-            match ev {
-                AgentEvent::Output { rid, bytes } => {
-                    if let Some(a) = agents.iter_mut().find(|a| a.rid == rid) {
-                        a.feed(&bytes);
-                    }
-                }
-                AgentEvent::ReaderClosed { rid } => {
-                    if let Some(a) = agents.iter_mut().find(|a| a.rid == rid) {
-                        a.poll_exit();
-                        if matches!(a.status, Status::Running) {
-                            a.status = Status::Exited(0);
-                        }
-                    }
-                }
-            }
-        }
-        for a in agents.iter_mut() {
-            a.poll_exit();
-        }
-
-        let model = ui::build_rows(&agents);
-        if !model.selectable.is_empty() {
-            selected = selected.min(model.selectable.len() - 1);
-        }
-
-        let footer = footer_for(focus, adding.is_some());
-        let modal = adding.as_ref().map(|s| AddModalState {
-            provider: s.provider,
-            cwd: s.cwd.as_str(),
-            cursor: s.cursor,
-        });
-        terminal.draw(|f| draw_main(f, &agents, &model, selected, focus, &footer, modal))?;
-
-        if event::poll(Duration::from_millis(50))? {
-            let ev = event::read()?;
-            handle_event(
-                ev,
-                &mut agents,
-                &model,
-                &mut selected,
-                &mut focus,
-                &mut adding,
-                &mut should_quit,
-                &mut next_rid,
-                &agent_tx,
-                &mut last_pane_dims,
-            );
-        }
-    }
-
-    for a in agents.iter_mut() {
-        a.kill();
-    }
-    Ok(())
 }
 
 struct AddingState {
@@ -163,200 +55,336 @@ struct AddingState {
     cursor: usize,
 }
 
-fn footer_for(focus: Focus, adding: bool) -> String {
-    if adding {
-        return " Enter: spawn   Esc: cancel ".into();
-    }
-    match focus {
-        Focus::Agent => " typing → focused agent   F1 → deck   Ctrl-C → interrupt agent ".into(),
-        Focus::Deck => {
-            " ↑/↓ select   1-9 attach   Enter focus agent   a add   x remove   q quit   F1 → agent "
-                .into()
-        }
-    }
+struct App {
+    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+    agents: Vec<Agent>,
+    selected: usize,
+    focus: Focus,
+    adding: Option<AddingState>,
+    should_quit: bool,
+    last_pane_dims: (u16, u16),
+    next_rid: RuntimeId,
+
+    agent_tx: Sender<AgentEvent>,
+    agent_rx: Receiver<AgentEvent>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_event(
-    ev: Event,
-    agents: &mut Vec<Agent>,
-    model: &ui::RowModel,
-    selected: &mut usize,
-    focus: &mut Focus,
-    adding: &mut Option<AddingState>,
-    should_quit: &mut bool,
-    next_rid: &mut RuntimeId,
-    agent_tx: &crossbeam_channel::Sender<AgentEvent>,
-    last_pane_dims: &mut (u16, u16),
-) {
-    match ev {
-        Event::Resize(cols, rows) => {
-            let pane = agent_pane_size(cols, rows);
-            if (pane.cols, pane.rows) != *last_pane_dims {
-                *last_pane_dims = (pane.cols, pane.rows);
-                for a in agents.iter_mut() {
-                    a.resize(pane.rows, pane.cols);
+impl App {
+    fn new(cfg: Config) -> Result<Self> {
+        let backend = CrosstermBackend::new(stdout());
+        let terminal = Terminal::new(backend).context("new terminal")?;
+
+        let (term_cols, term_rows) = crossterm::terminal::size().context("query terminal size")?;
+        let pane = agent_pane_size(term_cols, term_rows);
+        let initial_size = PtySize {
+            rows: pane.rows,
+            cols: pane.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        let (agent_tx, agent_rx) = unbounded::<AgentEvent>();
+        let mut next_rid: RuntimeId = 1;
+        let mut agents: Vec<Agent> = Vec::with_capacity(cfg.agents.len());
+        for ac in cfg.agents.iter() {
+            if ac.manual {
+                tracing::info!(id = %ac.id, "skipping manual agent");
+                continue;
+            }
+            let rid = next_rid;
+            next_rid += 1;
+            match Agent::spawn(ac, rid, initial_size, agent_tx.clone()) {
+                Ok(a) => agents.push(a),
+                Err(e) => {
+                    tracing::error!(id = %ac.id, error = ?e, "failed to spawn agent");
                 }
             }
         }
-        Event::Key(k) if k.kind == KeyEventKind::Press => {
-            // Modal swallows all keys until Enter or Esc.
-            if let Some(state) = adding.as_mut() {
-                let result = handle_adding_event(&k, state);
-                match result {
-                    AddingResult::Spawn => {
-                        let cwd = state.cwd.trim().to_string();
-                        let provider = state.provider;
-                        *adding = None;
-                        spawn_runtime_agent(
-                            agents,
-                            provider,
-                            &cwd,
-                            next_rid,
-                            agent_tx,
-                            last_pane_dims,
-                        );
-                    }
-                    AddingResult::Cancel => *adding = None,
-                    AddingResult::None => {}
-                }
-                return;
+
+        if agents.is_empty() {
+            return Err(anyhow::anyhow!("no agents could be spawned"));
+        }
+
+        Ok(Self {
+            terminal,
+            agents,
+            selected: 0,
+            focus: Focus::Agent,
+            adding: None,
+            should_quit: false,
+            last_pane_dims: (pane.cols, pane.rows),
+            next_rid,
+            agent_tx,
+            agent_rx,
+        })
+    }
+
+    fn run_loop(&mut self) -> Result<()> {
+        while !self.should_quit {
+            self.handle_pty_output();
+            self.poll_agent_exits();
+
+            let model = ui::build_rows(&self.agents);
+            if !model.selectable.is_empty() {
+                self.selected = self.selected.min(model.selectable.len() - 1);
             }
 
-            // F1 is reserved at the agentdeck level — it toggles which pane has
-            // focus and is never forwarded to any child. None of the supported
-            // agent CLIs bind F1, so this is the safest "always works" key.
-            if k.code == KeyCode::F(1) {
-                *focus = match *focus {
+            let footer = self.footer_for();
+            let modal = self.adding.as_ref().map(|s| AddModalState {
+                provider: s.provider,
+                cwd: s.cwd.as_str(),
+                cursor: s.cursor,
+            });
+            self.terminal.draw(|f| {
+                draw_main(
+                    f,
+                    &self.agents,
+                    &model,
+                    self.selected,
+                    self.focus,
+                    &footer,
+                    modal,
+                )
+            })?;
+
+            if event::poll(Duration::from_millis(50))? {
+                let ev = event::read()?;
+                self.handle_event(ev, &model)?;
+            }
+        }
+
+        for a in self.agents.iter_mut() {
+            a.kill();
+        }
+        Ok(())
+    }
+
+    fn handle_pty_output(&mut self) {
+        while let Ok(ev) = self.agent_rx.try_recv() {
+            match ev {
+                AgentEvent::Output { rid, bytes } => {
+                    if let Some(a) = self.agents.iter_mut().find(|a| a.rid == rid) {
+                        a.feed(&bytes);
+                    }
+                }
+                AgentEvent::ReaderClosed { rid } => {
+                    if let Some(a) = self.agents.iter_mut().find(|a| a.rid == rid) {
+                        a.poll_exit();
+                        if matches!(a.status, Status::Running) {
+                            a.status = Status::Exited(0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_agent_exits(&mut self) {
+        for a in self.agents.iter_mut() {
+            a.poll_exit();
+        }
+    }
+
+    fn footer_for(&self) -> String {
+        if self.adding.is_some() {
+            return " Enter: spawn   Esc: cancel ".into();
+        }
+        match self.focus {
+            Focus::Agent => " typing → focused agent   F1 → deck   Ctrl-C → interrupt agent ".into(),
+            Focus::Deck => {
+                " ↑/↓ select   1-9 focus   Enter focus agent   a add   x remove   q quit   F1 → agent "
+                    .into()
+            }
+        }
+    }
+
+    fn handle_event(&mut self, ev: Event, model: &ui::RowModel) -> Result<()> {
+        match ev {
+            Event::Resize(cols, rows) => {
+                let pane = agent_pane_size(cols, rows);
+                if (pane.cols, pane.rows) != self.last_pane_dims {
+                    self.last_pane_dims = (pane.cols, pane.rows);
+                    for a in self.agents.iter_mut() {
+                        a.resize(pane.rows, pane.cols);
+                    }
+                }
+            }
+            Event::Key(k) if k.kind == KeyEventKind::Press => {
+                if let Some(state) = self.adding.as_mut() {
+                    let result = handle_adding_event(k, state);
+                    match result {
+                        AddingResult::Spawn => {
+                            let cwd = state.cwd.trim().to_string();
+                            let provider = state.provider;
+                            self.adding = None;
+                            self.spawn_runtime_agent(provider, &cwd);
+                        }
+                        AddingResult::Cancel => self.adding = None,
+                        AddingResult::None => {}
+                    }
+                    return Ok(());
+                }
+
+                if self.focus == Focus::Deck {
+                    let action = keymap::map_deck_key(k);
+                    self.handle_action(action, model)?;
+                } else {
+                    // Check for F1 toggle even in agent focus mode.
+                    if k.code == event::KeyCode::F(1) {
+                        self.focus = Focus::Deck;
+                    } else {
+                        self.forward_to_agent(k, model);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_action(&mut self, action: Action, model: &ui::RowModel) -> Result<()> {
+        match action {
+            Action::Quit => self.should_quit = true,
+            Action::MoveUp => {
+                let n = model.selectable.len();
+                if n > 0 {
+                    self.selected = if self.selected == 0 { n - 1 } else { self.selected - 1 };
+                }
+            }
+            Action::MoveDown => {
+                let n = model.selectable.len();
+                if n > 0 {
+                    self.selected = (self.selected + 1) % n;
+                }
+            }
+            Action::FocusAgent => {
+                if self.agent_idx_at_selected(model).is_some() {
+                    self.focus = Focus::Agent;
+                }
+            }
+            Action::FocusIndex(i) => {
+                if i < model.selectable.len() {
+                    self.selected = i;
+                    self.focus = Focus::Agent;
+                }
+            }
+            Action::AddAgent => {
+                if let Some(ai) = self.agent_idx_at_selected(model) {
+                    let a = &self.agents[ai];
+                    let cwd = a.cwd_label.clone().unwrap_or_else(|| "~".into());
+                    let cursor = cwd.chars().count();
+                    self.adding = Some(AddingState {
+                        provider: a.provider,
+                        cwd,
+                        cursor,
+                    });
+                }
+            }
+            Action::RemoveAgent => {
+                if let Some(ai) = self.agent_idx_at_selected(model) {
+                    let a = self.agents.get_mut(ai).unwrap();
+                    a.kill();
+                    self.agents.remove(ai);
+                }
+            }
+            Action::ToggleFocus => {
+                self.focus = match self.focus {
                     Focus::Deck => Focus::Agent,
                     Focus::Agent => Focus::Deck,
                 };
-                return;
             }
-
-            match *focus {
-                Focus::Deck => {
-                    handle_deck_key(k, agents, model, selected, focus, adding, should_quit)
-                }
-                Focus::Agent => forward_to_agent(k, agents, model, *selected),
-            }
+            Action::None => {}
         }
-        _ => {}
+        Ok(())
     }
-}
 
-fn handle_deck_key(
-    k: KeyEvent,
-    agents: &mut Vec<Agent>,
-    model: &ui::RowModel,
-    selected: &mut usize,
-    focus: &mut Focus,
-    adding: &mut Option<AddingState>,
-    should_quit: &mut bool,
-) {
-    let n = model.selectable.len();
-    let agent_idx_at = |sel: usize| -> Option<usize> {
-        model.selectable.get(sel).and_then(|&row_idx| {
+    fn agent_idx_at_selected(&self, model: &ui::RowModel) -> Option<usize> {
+        model.selectable.get(self.selected).and_then(|&row_idx| {
             if let Some(ui::Row::Agent(ai)) = model.rows.get(row_idx) {
                 Some(*ai)
             } else {
                 None
             }
         })
-    };
+    }
 
-    match k.code {
-        KeyCode::Char('q') => *should_quit = true,
-        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => *should_quit = true,
-        KeyCode::Up | KeyCode::Char('k') if n > 0 => {
-            *selected = if *selected == 0 { n - 1 } else { *selected - 1 };
-        }
-        KeyCode::Down | KeyCode::Char('j') if n > 0 => {
-            *selected = (*selected + 1) % n;
-        }
-        KeyCode::Enter if agent_idx_at(*selected).is_some() => {
-            *focus = Focus::Agent;
-        }
-        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-            let i = (c as u8 - b'1') as usize;
-            if i < n {
-                *selected = i;
-                *focus = Focus::Agent;
+    fn spawn_runtime_agent(&mut self, provider: Provider, cwd: &str) {
+        let cfg = derive_child_config(&self.agents, provider, cwd, self.next_rid);
+        let rid = self.next_rid;
+        self.next_rid += 1;
+        let size = PtySize {
+            rows: self.last_pane_dims.1,
+            cols: self.last_pane_dims.0,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        match Agent::spawn(&cfg, rid, size, self.agent_tx.clone()) {
+            Ok(a) => {
+                tracing::info!(id = %cfg.id, "spawned runtime agent");
+                self.agents.push(a);
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to spawn runtime agent");
             }
         }
-        KeyCode::Char('a') | KeyCode::Char('+') => {
-            if let Some(ai) = agent_idx_at(*selected) {
-                let a = &agents[ai];
-                let cwd = a.cwd_label.clone().unwrap_or_else(|| "~".into());
-                let cursor = cwd.chars().count();
-                *adding = Some(AddingState {
-                    provider: a.provider,
-                    cwd,
-                    cursor,
-                });
-            }
-        }
-        KeyCode::Char('x') => {
-            if let Some(ai) = agent_idx_at(*selected) {
-                if let Some(a) = agents.get_mut(ai) {
-                    a.kill();
-                }
-                if ai < agents.len() {
-                    agents.remove(ai);
+    }
+
+    fn forward_to_agent(&mut self, k: KeyEvent, model: &ui::RowModel) {
+        if let Some(ai) = self.agent_idx_at_selected(model) {
+            if let Some(a) = self.agents.get_mut(ai) {
+                if let Some(bytes) = keymap::key_event_to_bytes(&k) {
+                    let _ = a.write(&bytes);
                 }
             }
         }
-        _ => {}
     }
 }
 
-fn forward_to_agent(k: KeyEvent, agents: &mut [Agent], model: &ui::RowModel, selected: usize) {
-    let Some(ai) = model.selectable.get(selected).and_then(|&row_idx| {
-        if let Some(ui::Row::Agent(ai)) = model.rows.get(row_idx) {
-            Some(*ai)
-        } else {
-            None
-        }
-    }) else {
-        return;
-    };
-    let Some(a) = agents.get_mut(ai) else { return };
-    if let Some(bytes) = key_event_to_bytes(&k) {
-        let _ = a.write(&bytes);
-    }
-}
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AddingResult {
     None,
     Spawn,
     Cancel,
 }
 
-fn handle_adding_event(k: &KeyEvent, state: &mut AddingState) -> AddingResult {
+fn handle_adding_event(k: KeyEvent, state: &mut AddingState) -> AddingResult {
     match k.code {
-        KeyCode::Esc => return AddingResult::Cancel,
-        KeyCode::Enter => return AddingResult::Spawn,
-        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-            return AddingResult::Cancel;
+        event::KeyCode::Esc => AddingResult::Cancel,
+        event::KeyCode::Enter => AddingResult::Spawn,
+        event::KeyCode::Char('c') if k.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            AddingResult::Cancel
         }
-        KeyCode::Char(c) => {
+        event::KeyCode::Char(c) => {
             let idx = byte_index_for_char_cursor(&state.cwd, state.cursor);
             state.cwd.insert(idx, c);
             state.cursor += 1;
+            AddingResult::None
         }
-        KeyCode::Backspace if state.cursor > 0 => {
+        event::KeyCode::Backspace if state.cursor > 0 => {
             let end = byte_index_for_char_cursor(&state.cwd, state.cursor);
             let start = byte_index_for_char_cursor(&state.cwd, state.cursor - 1);
             state.cwd.drain(start..end);
             state.cursor -= 1;
+            AddingResult::None
         }
-        KeyCode::Left if state.cursor > 0 => state.cursor -= 1,
-        KeyCode::Right if state.cursor < state.cwd.chars().count() => state.cursor += 1,
-        KeyCode::Home => state.cursor = 0,
-        KeyCode::End => state.cursor = state.cwd.chars().count(),
-        _ => {}
+        event::KeyCode::Left if state.cursor > 0 => {
+            state.cursor -= 1;
+            AddingResult::None
+        }
+        event::KeyCode::Right if state.cursor < state.cwd.chars().count() => {
+            state.cursor += 1;
+            AddingResult::None
+        }
+        event::KeyCode::Home => {
+            state.cursor = 0;
+            AddingResult::None
+        }
+        event::KeyCode::End => {
+            state.cursor = state.cwd.chars().count();
+            AddingResult::None
+        }
+        _ => AddingResult::None,
     }
-    AddingResult::None
 }
 
 fn byte_index_for_char_cursor(s: &str, char_cursor: usize) -> usize {
@@ -366,36 +394,6 @@ fn byte_index_for_char_cursor(s: &str, char_cursor: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn spawn_runtime_agent(
-    agents: &mut Vec<Agent>,
-    provider: Provider,
-    cwd: &str,
-    next_rid: &mut RuntimeId,
-    agent_tx: &crossbeam_channel::Sender<AgentEvent>,
-    pane_dims: &(u16, u16),
-) {
-    let cfg = derive_child_config(agents, provider, cwd, *next_rid);
-    let rid = *next_rid;
-    *next_rid += 1;
-    let size = PtySize {
-        rows: pane_dims.1,
-        cols: pane_dims.0,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-    match Agent::spawn(&cfg, rid, size, agent_tx.clone()) {
-        Ok(a) => {
-            tracing::info!(id = %cfg.id, "spawned runtime agent");
-            agents.push(a);
-        }
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to spawn runtime agent");
-        }
-    }
-}
-
-/// Build a config for a runtime-spawned agent. Inherits command / args / env
-/// from the most recent existing agent of the same provider and overrides cwd.
 fn derive_child_config(
     agents: &[Agent],
     provider: Provider,
@@ -439,6 +437,7 @@ fn provider_display(p: Provider) -> &'static str {
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
         Provider::Gemini => "Gemini",
+        Provider::Aider => "Aider",
         Provider::Other => "agent",
     }
 }

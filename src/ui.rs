@@ -34,6 +34,7 @@ pub fn build_rows(agents: &[Agent]) -> RowModel {
         Provider::Claude,
         Provider::Codex,
         Provider::Gemini,
+        Provider::Aider,
         Provider::Other,
     ];
     let mut rows: Vec<Row> = Vec::new();
@@ -304,11 +305,6 @@ fn render_agent_pane(f: &mut Frame, agent: Option<&Agent>, focus: Focus, area: R
     }
 }
 
-/// Convert one row of a vt100 Screen into a styled ratatui Line.
-///
-/// We group consecutive cells with the same style into a single Span so we
-/// don't emit one Span per character. Empty cells (wide-char placeholders)
-/// flush the current run since their style is unknown.
 fn row_to_line(screen: &vt100::Screen, row: u16, cols: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut run_style: Option<Style> = None;
@@ -331,9 +327,6 @@ fn row_to_line(screen: &vt100::Screen, row: u16, cols: u16) -> Line<'static> {
         };
         let contents = cell.contents();
         if contents.is_empty() {
-            // Either an empty cell or the right half of a wide char. Either
-            // way, contribute a single space so we don't end up with a too-
-            // short row. We don't try to preserve style across empty cells.
             run_text.push(' ');
             continue;
         }

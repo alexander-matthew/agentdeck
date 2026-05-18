@@ -68,6 +68,7 @@ pub enum Provider {
     Claude,
     Codex,
     Gemini,
+    Aider,
     Other,
 }
 
@@ -77,6 +78,7 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::Gemini => "gemini",
+            Provider::Aider => "aider",
             Provider::Other => "other",
         }
     }

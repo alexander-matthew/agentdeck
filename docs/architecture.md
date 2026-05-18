@@ -52,9 +52,9 @@ There is no separate stdin reader thread anymore. The main loop pulls everything
 | `src/config.rs` | `Config`, `Settings`, `AgentConfig`, `Provider`. Load-or-init logic, path expansion. |
 | `src/agent.rs` | `Agent` struct, PTY spawn, reader thread, vt100 parser, activity timestamps, exit polling. |
 | `src/state.rs` | `LiveState` enum and `detect()` function: combines activity windows with provider-specific terminal-output heuristics to label what an agent is doing. |
-| `src/keymap.rs` | Serialize a crossterm `KeyEvent` back to the bytes a PTY child expects (chars, Alt/Ctrl-modified, arrows, F2–F12, navigation). |
+| `src/keymap.rs` | Centralized key handling: mapping UI actions for the deck AND serializing agent input back to PTY bytes. |
 | `src/ui.rs` | All rendering: header bar, sidebar (deck) with status badges, agent pane that renders the focused agent's vt100 grid as styled ratatui spans, add-agent modal. |
-| `src/app.rs` | The event loop, focus state (`Deck` / `Agent`), modal state, PTY-resize bookkeeping, F1 hijack. |
+| `src/app.rs` | The core `App` struct and event loop, mode management, attach/detach orchestration. |
 
 ## Data flow
 
@@ -72,7 +72,7 @@ There is no separate stdin reader thread anymore. The main loop pulls everything
 1. `crossterm::event::poll` returns parsed `Event`s (key, resize, mouse).
 2. `KeyEvent`s when focus is on the agent are sent through `keymap::key_event_to_bytes`, which serializes them back to the byte sequences the inner CLI expects: e.g. `KeyCode::Up` → `\x1b[A`, `Ctrl-C` → `\x03`, `Alt-x` → `\x1b x`, modified arrows → `\x1b[1;<mods><letter>`.
 3. The resulting bytes are written to the focused agent's PTY master via `Agent::write`.
-4. When focus is on the deck, key events drive deck actions (`j`/`k`, `1-9`, `a`, `x`, `q`) and never reach an agent.
+4. When focus is on the deck, key events drive deck actions (`j`/`k`, `1-9`, `a`, `x`, `q`) via `keymap::map_deck_key` and never reach an agent.
 
 The single key reserved at the agentdeck layer is `F1` — it is consumed before either branch above runs, and toggles `Focus::Deck` ↔ `Focus::Agent`. No supported agent CLI binds F1, so this is the "always free" key.
 
@@ -145,11 +145,3 @@ When upstream CLIs redesign their UI, the provider-specific helper for that CLI 
 ## Logging
 
 `tracing` is configured in `main.rs` to write to `~/.local/state/agentdeck/agentdeck.log` with `with_ansi(false)`. The TUI never logs to stdout/stderr — that would corrupt the screen. Log level is controlled by `AGENTDECK_LOG`.
-
-## What's intentionally absent
-
-- **No async runtime.** Tokio was considered and rejected. The whole loop fits in `std::thread` + crossbeam channels; an executor wouldn't earn its complexity.
-- **No transcript persistence.** Each agent owns its own state. agentdeck adds zero session storage on top.
-- **No provider abstraction layer.** The `Provider` enum is a display tag and a routing key for state-detection heuristics, nothing more.
-- **No mouse support yet.** Easy add (crossterm parses mouse events natively), deferred until needed.
-- **No raw-bytes passthrough mode.** The old full-screen `attach` model is gone in favour of split view; if you need perfect terminal fidelity for one specific session, run that one CLI in a separate shell.
