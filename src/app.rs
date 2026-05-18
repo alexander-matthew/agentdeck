@@ -266,8 +266,9 @@ impl App {
                 }
             }
             Action::RemoveAgent => {
-                if let Some(ai) = self.agent_idx_at_selected(model) {
-                    let a = self.agents.get_mut(ai).unwrap();
+                if let Some(ai) = self.agent_idx_at_selected(model)
+                    && let Some(a) = self.agents.get_mut(ai)
+                {
                     a.kill();
                     self.agents.remove(ai);
                 }
