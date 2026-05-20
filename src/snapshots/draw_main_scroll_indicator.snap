@@ -1,0 +1,14 @@
+ agentdeck    focus: agent   [1 agents]   Ctrl-Space to toggle focus                                
+┌ agents ──────────────────────────┐┌ alpha · running · working  [scrolled 3/24] (End to jump to li┐
+│  claude (1)                      ││line 31                                                       │
+│▶  1 ● alpha           working    ││line 32                                                       │
+│                                  ││line 33                                                       │
+│                                  ││line 34                                                       │
+│                                  ││line 35                                                       │
+│                                  ││line 36                                                       │
+│                                  ││line 37                                                       │
+│                                  ││line 38                                                       │
+│                                  ││line 39                                                       │
+│                                  ││                                                              │
+└──────────────────────────────────┘└──────────────────────────────────────────────────────────────┘
+ footer                                                                                             
