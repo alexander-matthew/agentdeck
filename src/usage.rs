@@ -206,3 +206,111 @@ fn read_truncated<R: Read>(reader: &mut R, dest: &mut String) {
     }
     dest.push_str(&String::from_utf8_lossy(&buf));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cmds(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn from_commands_skips_empty_and_whitespace_values() {
+        let state = UsageState::from_commands(&cmds(&[
+            ("claude", "  ccusage  "),
+            ("codex", ""),
+            ("gemini", "   "),
+        ]));
+        assert_eq!(state.entries.len(), 1);
+        let entry = state.entries.get("claude").expect("claude entry exists");
+        assert_eq!(entry.provider, "claude");
+        assert_eq!(entry.command, "ccusage");
+        assert!(!state.entries.contains_key("codex"));
+        assert!(!state.entries.contains_key("gemini"));
+    }
+
+    #[test]
+    fn is_empty_reflects_entry_presence() {
+        assert!(UsageState::default().is_empty());
+        let state = UsageState::from_commands(&cmds(&[("claude", "ccusage")]));
+        assert!(!state.is_empty());
+    }
+
+    #[test]
+    fn started_event_sets_refreshing_only_for_known_provider() {
+        let mut state = UsageState::from_commands(&cmds(&[("claude", "ccusage")]));
+        state.apply(UsageEvent::Started {
+            provider: "nonexistent".into(),
+        });
+        assert_eq!(state.entries.len(), 1);
+        assert!(!state.entries["claude"].refreshing);
+
+        state.apply(UsageEvent::Started {
+            provider: "claude".into(),
+        });
+        assert!(state.entries["claude"].refreshing);
+    }
+
+    #[test]
+    fn result_success_clears_error_and_populates_output() {
+        let mut state = UsageState::from_commands(&cmds(&[("claude", "ccusage")]));
+        // Seed prior error + refreshing state to verify reset behavior.
+        {
+            let entry = state.entries.get_mut("claude").unwrap();
+            entry.last_error = Some("previous failure".into());
+            entry.refreshing = true;
+        }
+        let now = Instant::now();
+        state.apply(UsageEvent::Result {
+            provider: "claude".into(),
+            output: "tokens: 42".into(),
+            error: None,
+            at: now,
+        });
+        let entry = &state.entries["claude"];
+        assert!(!entry.refreshing);
+        assert_eq!(entry.last_output.as_deref(), Some("tokens: 42"));
+        assert_eq!(entry.last_error, None);
+        assert_eq!(entry.last_run_at, Some(now));
+    }
+
+    #[test]
+    fn result_error_preserves_prior_output_and_stores_error() {
+        let mut state = UsageState::from_commands(&cmds(&[("claude", "ccusage")]));
+        state.apply(UsageEvent::Result {
+            provider: "claude".into(),
+            output: "tokens: 42".into(),
+            error: None,
+            at: Instant::now(),
+        });
+        state.apply(UsageEvent::Result {
+            provider: "claude".into(),
+            output: String::new(),
+            error: Some("boom".into()),
+            at: Instant::now(),
+        });
+        let entry = &state.entries["claude"];
+        assert_eq!(entry.last_output.as_deref(), Some("tokens: 42"));
+        assert_eq!(entry.last_error.as_deref(), Some("boom"));
+        assert!(!entry.refreshing);
+    }
+
+    #[test]
+    fn result_for_unknown_provider_is_a_noop() {
+        let mut state = UsageState::from_commands(&cmds(&[("claude", "ccusage")]));
+        state.apply(UsageEvent::Result {
+            provider: "ghost".into(),
+            output: "x".into(),
+            error: None,
+            at: Instant::now(),
+        });
+        assert_eq!(state.entries.len(), 1);
+        let entry = &state.entries["claude"];
+        assert!(entry.last_output.is_none());
+        assert!(entry.last_run_at.is_none());
+    }
+}
