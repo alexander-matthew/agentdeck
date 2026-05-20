@@ -804,8 +804,11 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::agent::test_helpers::mock_agent;
+    use crate::usage::{UsageEvent, UsageState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
 
     fn buf_lines(term: &Terminal<TestBackend>) -> Vec<String> {
         let buf = term.backend().buffer();
@@ -864,5 +867,136 @@ mod tests {
             assert!(body.contains(needle), "sidebar missing {needle:?}");
         }
         assert!(lines[23].contains("footer"), "footer row: {:?}", lines[23]);
+    }
+
+    #[test]
+    fn draw_main_grid_renders_all_visible_agent_names_in_tiles() {
+        let agents = vec![
+            mock_agent(Provider::Claude, "alpha"),
+            mock_agent(Provider::Codex, "bravo"),
+            mock_agent(Provider::Gemini, "charlie"),
+            mock_agent(Provider::Aider, "delta"),
+        ];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Grid,
+                (2, 2),
+                &visible,
+                false,
+                &usage,
+                " footer ",
+                None,
+                None,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
+
+        let lines = buf_lines(&term);
+        assert_eq!(lines.len(), 30);
+        let body = lines[1..29].join("\n");
+        for needle in ["alpha", "bravo", "charlie", "delta"] {
+            assert!(body.contains(needle), "grid body missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn draw_main_usage_dashboard_renders_each_provider_card() {
+        let agents = vec![mock_agent(Provider::Claude, "alpha")];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+
+        let mut cmds = BTreeMap::new();
+        cmds.insert("claude".to_string(), "echo hi".to_string());
+        cmds.insert("codex".to_string(), "echo bye".to_string());
+        let mut usage = UsageState::from_commands(&cmds);
+        usage.apply(UsageEvent::Result {
+            provider: "claude".to_string(),
+            output: "spend: $1.23".to_string(),
+            error: None,
+            at: Instant::now(),
+        });
+
+        let mut term = Terminal::new(TestBackend::new(120, 30)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                true,
+                &usage,
+                " footer ",
+                None,
+                None,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
+
+        let lines = buf_lines(&term);
+        let all = lines.join("\n");
+        for needle in ["claude", "codex", "spend: $1.23"] {
+            assert!(all.contains(needle), "usage pane missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn draw_main_agent_focus_chip_switches_color_label() {
+        let agents = vec![mock_agent(Provider::Claude, "alpha")];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+
+        let render = |focus: Focus| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(80, 24)).expect("backend");
+            term.draw(|f| {
+                draw_main(
+                    f,
+                    &agents,
+                    &model,
+                    0,
+                    focus,
+                    ViewMode::Single,
+                    (1, 1),
+                    &visible,
+                    false,
+                    &usage,
+                    " footer ",
+                    None,
+                    None,
+                    "Ctrl-Space",
+                )
+            })
+            .expect("draw");
+            buf_lines(&term)
+        };
+
+        let deck_lines = render(Focus::Deck);
+        assert!(
+            deck_lines[0].contains("focus: deck"),
+            "deck header: {:?}",
+            deck_lines[0]
+        );
+
+        let agent_lines = render(Focus::Agent);
+        assert!(
+            agent_lines[0].contains("focus: agent"),
+            "agent header: {:?}",
+            agent_lines[0]
+        );
     }
 }
