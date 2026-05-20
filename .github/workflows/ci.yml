@@ -9,6 +9,10 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # Opt the @v4 javascript actions onto Node 24 ahead of GitHub's
+      # 2026-06-02 forced default + 2026-09-16 Node 20 removal.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
