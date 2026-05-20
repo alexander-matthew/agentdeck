@@ -130,6 +130,13 @@ struct App {
 impl App {
     fn new(cfg: Config) -> Result<Self> {
         let toggle_key = keymap::parse_key(&cfg.settings.toggle_key);
+        // User-visible signal lives in ~/.local/state/agentdeck/agentdeck.log.
+        if toggle_key.is_none() && cfg.settings.toggle_key != "ctrl-space" {
+            tracing::warn!(
+                value = %cfg.settings.toggle_key,
+                "could not parse [settings].toggle_key; falling back to ctrl-space"
+            );
+        }
         let backend = CrosstermBackend::new(stdout());
         let terminal = Terminal::new(backend).context("new terminal")?;
 
@@ -1024,6 +1031,15 @@ mod tests {
         let mut st = (0, Focus::Deck, false);
         apply(KeyCode::Up, KeyModifiers::NONE, &mut st, &model);
         assert_eq!(st.0, 1);
+    }
+
+    #[test]
+    fn unparseable_toggle_key_returns_none() {
+        // Precondition for the warn-log in App::new: parse_key must return None
+        // for obviously-bad strings. The log emission itself is not unit-testable
+        // without a tracing fixture; the user-visible signal is the log entry at
+        // ~/.local/state/agentdeck/agentdeck.log.
+        assert!(keymap::parse_key("ctrl-spacebar").is_none());
     }
 
     #[test]
