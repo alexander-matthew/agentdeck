@@ -1077,6 +1077,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
@@ -1116,6 +1117,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
@@ -1170,6 +1172,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
