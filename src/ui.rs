@@ -1,3 +1,17 @@
+//! Pure rendering layer for the TUI.
+//!
+//! Every function here takes immutable references to `App` state and produces
+//! a frame — no state mutation happens in this module. Input handling and
+//! side effects live in [`crate::app`]; this file only knows how to draw.
+//!
+//! Layout is driven by the `SIDEBAR_WIDTH` constant: a fixed-width left
+//! sidebar listing agents (grouped by provider, ordered by the current sort
+//! mode and flattened into a `Row` model), and a right-hand pane that either
+//! shows a single focused agent or a grid of agents per [`ViewMode`]. Modal
+//! overlays (add-agent picker, usage dashboard) are drawn last on top of the
+//! main frame using `Clear`. Any new visual surface should follow the same
+//! "take refs, return frames" contract.
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Position, Rect},
