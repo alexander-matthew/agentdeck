@@ -359,7 +359,20 @@ fn render_agent_cell(f: &mut Frame, agent: Option<&Agent>, is_input_target: bool
             let live = state::detect(a);
             let mut label = format!(" {} · {} · {} ", a.name, a.status.label(), live.short());
             if a.scroll_offset > 0 {
-                label.push_str(&format!(" [scrolled up {}] ", a.scroll_offset));
+                let screen = a.parser.screen();
+                let (grid_rows, _) = screen.size();
+                let m = screen.scrollback() + grid_rows as usize;
+                if m > 0 {
+                    label.push_str(&format!(
+                        " [scrolled {}/{}] (End to jump to live) ",
+                        a.scroll_offset, m
+                    ));
+                } else {
+                    label.push_str(&format!(
+                        " [scrolled {}] (End to jump to live) ",
+                        a.scroll_offset
+                    ));
+                }
             }
             label
         }
@@ -952,6 +965,89 @@ mod tests {
         for needle in ["claude", "codex", "spend: $1.23"] {
             assert!(all.contains(needle), "usage pane missing {needle:?}");
         }
+    }
+
+    #[test]
+    fn draw_main_renders_scrolled_position_indicator_and_hint() {
+        let mut alpha = mock_agent(Provider::Claude, "alpha");
+        // Feed enough lines to push rows into vt100 scrollback (>24 visible rows).
+        let mut bytes = String::new();
+        for i in 0..40 {
+            bytes.push_str(&format!("line {i}\r\n"));
+        }
+        alpha.feed(bytes.as_bytes());
+        alpha.scroll_offset = 3;
+
+        let agents = vec![alpha];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Agent,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " footer ",
+                None,
+                None,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
+
+        let lines = buf_lines(&term);
+        let all = lines.join("\n");
+        assert!(
+            all.contains("[scrolled 3/"),
+            "missing scrolled N/M indicator: {all}"
+        );
+        assert!(
+            all.contains("(End to jump to live)"),
+            "missing jump-to-live hint: {all}"
+        );
+    }
+
+    #[test]
+    fn draw_main_no_scroll_indicator_when_offset_zero() {
+        let agents = vec![mock_agent(Provider::Claude, "alpha")];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Agent,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " footer ",
+                None,
+                None,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
+
+        let all = buf_lines(&term).join("\n");
+        assert!(!all.contains("scrolled"), "unexpected scroll text: {all}");
+        assert!(
+            !all.contains("(End to jump to live)"),
+            "unexpected hint: {all}"
+        );
     }
 
     #[test]
