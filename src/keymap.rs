@@ -23,6 +23,8 @@ pub enum Action {
     ToggleView,
     /// Show / hide the centralized usage dashboard.
     ToggleUsage,
+    /// Show / hide the keybindings help overlay.
+    ToggleHelp,
     FocusNextWaiting,
     RenameAgent,
     None,
@@ -61,6 +63,7 @@ pub fn map_deck_key(ev: KeyEvent, toggle_key: Option<KeyEvent>) -> Action {
         KeyCode::Char('o') => Action::CycleSort,
         KeyCode::Char('g') => Action::ToggleView,
         KeyCode::Char('u') => Action::ToggleUsage,
+        KeyCode::Char('?') | KeyCode::F(1) => Action::ToggleHelp,
         KeyCode::Tab => Action::FocusNextWaiting,
 
         _ => Action::None,
@@ -339,6 +342,15 @@ mod tests {
             map_deck_key(k(KeyCode::Char('u')), None),
             Action::ToggleUsage
         );
+    }
+
+    #[test]
+    fn map_deck_key_question_mark_and_f1_toggle_help() {
+        assert_eq!(
+            map_deck_key(k(KeyCode::Char('?')), None),
+            Action::ToggleHelp
+        );
+        assert_eq!(map_deck_key(k(KeyCode::F(1)), None), Action::ToggleHelp);
     }
 
     #[test]

@@ -128,6 +128,7 @@ pub fn draw_main(
     footer: &str,
     modal: Option<AddModalState>,
     rename_modal: Option<RenameModalState>,
+    help_visible: bool,
     tk_label: &str,
 ) {
     let chunks = Layout::default()
@@ -194,6 +195,9 @@ pub fn draw_main(
     }
     if let Some(m) = rename_modal {
         render_rename_modal(f, m);
+    }
+    if help_visible {
+        render_help_modal(f, tk_label);
     }
 }
 
@@ -790,6 +794,64 @@ fn render_rename_modal(f: &mut Frame, m: RenameModalState) {
     );
 }
 
+fn render_help_modal(f: &mut Frame, tk_label: &str) {
+    let area = f.area();
+    let width = area.width.clamp(40, 78);
+    let height = 11u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " keybindings ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let label = |s: &'static str| {
+        Span::styled(
+            s,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let lines = vec![
+        Line::from(vec![
+            label("Navigation:  "),
+            Span::raw("j/k/↑/↓ move · 1–9 jump · Enter focus agent · Tab next waiting"),
+        ]),
+        Line::from(vec![
+            label("Focus:       "),
+            Span::raw(format!("{tk_label} toggle deck/agent · q or Ctrl-C quit")),
+        ]),
+        Line::from(vec![
+            label("View:        "),
+            Span::raw("g grid · u usage · o cycle sort"),
+        ]),
+        Line::from(vec![
+            label("Agents:      "),
+            Span::raw("a/+ add · x remove · r rename"),
+        ]),
+        Line::from(vec![label("Misc:        "), Span::raw("? help · F1 help")]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " press any key to close ",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -843,6 +905,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
@@ -896,6 +959,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
@@ -942,6 +1006,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
@@ -978,6 +1043,7 @@ mod tests {
                     " footer ",
                     None,
                     None,
+                    false,
                     "Ctrl-Space",
                 )
             })
@@ -997,6 +1063,64 @@ mod tests {
             agent_lines[0].contains("focus: agent"),
             "agent header: {:?}",
             agent_lines[0]
+        );
+    }
+
+    #[test]
+    fn draw_main_help_modal_lists_all_categories_with_dynamic_toggle_label() {
+        let agents = vec![
+            mock_agent(Provider::Claude, "alpha"),
+            mock_agent(Provider::Codex, "bravo"),
+            mock_agent(Provider::Gemini, "charlie"),
+        ];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let mut term = Terminal::new(TestBackend::new(100, 26)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " ?:help ",
+                None,
+                None,
+                true,
+                "ctrl-space",
+            )
+        })
+        .expect("draw");
+
+        let lines = buf_lines(&term);
+        let all = lines.join("\n");
+        for needle in [
+            "keybindings",
+            "Navigation:",
+            "Focus:",
+            "View:",
+            "Agents:",
+            "Misc:",
+            "j/k/↑/↓",
+            "g grid",
+            "a/+ add",
+            "? help",
+            "F1 help",
+            "ctrl-space toggle deck/agent",
+            "press any key to close",
+        ] {
+            assert!(all.contains(needle), "help modal missing {needle:?}");
+        }
+        assert!(
+            lines[lines.len() - 1].contains("?:help"),
+            "footer should advertise ?:help: {:?}",
+            lines[lines.len() - 1]
         );
     }
 }
