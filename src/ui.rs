@@ -1050,6 +1050,71 @@ mod tests {
         );
     }
 
+    /// Snapshot test for the scrolled-position indicator in the agent pane
+    /// header. Compares the full rendered buffer against the checked-in
+    /// fixture at `src/snapshots/draw_main_scroll_indicator.snap`.
+    ///
+    /// To refresh after an intentional UI change, run with
+    /// `UPDATE_SNAPSHOTS=1 cargo test draw_main_scroll_indicator_matches_snapshot`
+    /// then commit the regenerated `.snap`.
+    ///
+    /// Hand-rolled because `insta` is not available — `Cargo.toml` is a
+    /// protected path for the agent loop and dependency changes are
+    /// human-only.
+    #[test]
+    fn draw_main_scroll_indicator_matches_snapshot() {
+        let mut alpha = mock_agent(Provider::Claude, "alpha");
+        let mut bytes = String::new();
+        for i in 0..40 {
+            bytes.push_str(&format!("line {i}\r\n"));
+        }
+        alpha.feed(bytes.as_bytes());
+        alpha.scroll_offset = 3;
+
+        let agents = vec![alpha];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let mut term = Terminal::new(TestBackend::new(100, 14)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Agent,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " footer ",
+                None,
+                None,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
+
+        let actual = buf_lines(&term).join("\n") + "\n";
+
+        let snapshot_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/snapshots/draw_main_scroll_indicator.snap",
+        );
+
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(snapshot_path, &actual).expect("write snapshot");
+            return;
+        }
+
+        let expected = include_str!("snapshots/draw_main_scroll_indicator.snap");
+        assert_eq!(
+            actual, expected,
+            "scroll-indicator snapshot drift; rerun with UPDATE_SNAPSHOTS=1 to refresh",
+        );
+    }
+
     #[test]
     fn draw_main_agent_focus_chip_switches_color_label() {
         let agents = vec![mock_agent(Provider::Claude, "alpha")];
