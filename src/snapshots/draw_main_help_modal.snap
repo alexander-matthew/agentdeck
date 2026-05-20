@@ -1,0 +1,26 @@
+ agentdeck    focus: deck   [3 agents]   ctrl-space to toggle focus                                 
+┌ agents ──────────────────────────┐┌ alpha · running · idle ──────────────────────────────────────┐
+│  claude (1)                      ││                                                              │
+│▶  1 ● alpha              idle    ││                                                              │
+│  codex (1)                       ││                                                              │
+│   2 ● bravo              idle    ││                                                              │
+│  gemini (1)                      ││                                                              │
+│   3 ● cha┌ keybindings ───────────────────────────────────────────────────────────────┐          │
+│          │Navigation:  j/k/↑/↓ move · 1–9 jump · Enter focus agent · Tab next waiting │          │
+│          │Focus:       ctrl-space toggle deck/agent · q or Ctrl-C quit                │          │
+│          │View:        g grid · u usage · o cycle sort                                │          │
+│          │Agents:      a/+ add · x remove · r rename                                  │          │
+│          │Misc:        ? help · F1 help                                               │          │
+│          │                                                                            │          │
+│          │ press any key to close                                                     │          │
+│          │                                                                            │          │
+│          │                                                                            │          │
+│          └────────────────────────────────────────────────────────────────────────────┘          │
+│                                  ││                                                              │
+│                                  ││                                                              │
+│                                  ││                                                              │
+│                                  ││                                                              │
+│                                  ││                                                              │
+│                                  ││                                                              │
+└──────────────────────────────────┘└──────────────────────────────────────────────────────────────┘
+ ?:help                                                                                             

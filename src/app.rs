@@ -108,6 +108,7 @@ struct App {
     sort_mode: ui::SortMode,
     adding: Option<AddingState>,
     renaming: Option<RenamingState>,
+    help_visible: bool,
     should_quit: bool,
     last_pane_dims: (u16, u16),
     next_rid: RuntimeId,
@@ -185,6 +186,7 @@ impl App {
             sort_mode: ui::SortMode::Provider,
             adding: None,
             renaming: None,
+            help_visible: false,
             should_quit: false,
             last_pane_dims: (pane.cols, pane.rows),
             next_rid,
@@ -236,6 +238,7 @@ impl App {
             let view = self.view_mode;
             let grid = self.grid_dims;
             let showing_usage = self.showing_usage;
+            let help_visible = self.help_visible;
             let usage_snapshot = self.usage_state.clone();
             self.terminal.draw(|f| {
                 draw_main(
@@ -252,6 +255,7 @@ impl App {
                     &footer,
                     modal,
                     rename_modal,
+                    help_visible,
                     &tk_label,
                 )
             })?;
@@ -397,7 +401,7 @@ impl App {
                 " typing → focused agent   {tk} → deck   Ctrl-C → interrupt   [{view_chip}] "
             ),
             Focus::Deck => format!(
-                " ↑/↓ select   1-9 focus   Tab jump   Enter focus   a add   x remove   r rename   o sort   g grid   u usage   q quit   {tk} → agent   [{view_chip}] "
+                " ↑/↓ select   1-9 focus   Tab jump   Enter focus   a add   x remove   r rename   o sort   g grid   u usage   ?:help   q quit   {tk} → agent   [{view_chip}] "
             ),
         }
     }
@@ -470,6 +474,11 @@ impl App {
             }
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 self.last_user_activity = Instant::now();
+                if self.help_visible {
+                    // Any key closes the help overlay; do not forward to the PTY.
+                    self.help_visible = false;
+                    return Ok(());
+                }
                 if let Some(state) = self.adding.as_mut() {
                     let result = handle_adding_event(k, state);
                     match result {
@@ -671,6 +680,9 @@ impl App {
                 if self.showing_usage {
                     self.maybe_tick_usage_refresh();
                 }
+            }
+            Action::ToggleHelp => {
+                self.help_visible = !self.help_visible;
             }
             Action::FocusNextWaiting => {
                 let n = model.selectable.len();
@@ -935,6 +947,7 @@ fn apply_nav_action(
         | Action::CycleSort
         | Action::ToggleView
         | Action::ToggleUsage
+        | Action::ToggleHelp
         | Action::FocusNextWaiting => return false,
     }
     true
