@@ -1,3 +1,19 @@
+//! Main event loop and top-level `App` state.
+//!
+//! Owns the terminal, the set of running [`Agent`]s, and the channels they
+//! emit on. The loop fans `AgentEvent`s and `UsageEvent`s in from background
+//! reader threads while polling crossterm for input, then dispatches each
+//! key to one of four handlers depending on focus and modal state: deck
+//! navigation, the focused agent's PTY, the add-agent modal, or the usage
+//! dashboard. Focus toggles between deck and agent via the keymap; when no
+//! mapping fires, the configured `toggle_key` is the fallback.
+//!
+//! The PTY-size invariant lives in [`agent_pane_size`] (see lines 35-54):
+//! every time the view mode or grid shape changes, each agent's parser must
+//! be resized to match the cell it will be drawn into, otherwise rendering
+//! desyncs. Pure rendering belongs in [`crate::ui`]; this module is the only
+//! place that mutates `App`.
+
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{
