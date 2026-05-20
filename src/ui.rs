@@ -1123,4 +1123,64 @@ mod tests {
             lines[lines.len() - 1]
         );
     }
+
+    /// Snapshot test for the help-overlay modal.
+    ///
+    /// Compares the rendered buffer against the checked-in snapshot at
+    /// `src/snapshots/draw_main_help_modal.snap`. If the rendering changes
+    /// deliberately, regenerate the snapshot by running this test with the
+    /// env var `UPDATE_SNAPSHOTS=1` set, then commit the new `.snap`.
+    ///
+    /// We hand-roll snapshot file comparison here because `insta` is not
+    /// available (Cargo.toml is a protected path for the agent loop).
+    #[test]
+    fn draw_main_help_modal_matches_snapshot() {
+        let agents = vec![
+            mock_agent(Provider::Claude, "alpha"),
+            mock_agent(Provider::Codex, "bravo"),
+            mock_agent(Provider::Gemini, "charlie"),
+        ];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let mut term = Terminal::new(TestBackend::new(100, 26)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " ?:help ",
+                None,
+                None,
+                true,
+                "ctrl-space",
+            )
+        })
+        .expect("draw");
+
+        let actual = buf_lines(&term).join("\n") + "\n";
+
+        let snapshot_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/snapshots/draw_main_help_modal.snap",
+        );
+
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(snapshot_path, &actual).expect("write snapshot");
+            return;
+        }
+
+        let expected = include_str!("snapshots/draw_main_help_modal.snap");
+        assert_eq!(
+            actual, expected,
+            "help-modal snapshot drift; rerun with UPDATE_SNAPSHOTS=1 to refresh",
+        );
+    }
 }
