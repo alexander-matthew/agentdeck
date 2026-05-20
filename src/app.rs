@@ -1,3 +1,19 @@
+//! Main event loop and top-level `App` state.
+//!
+//! Owns the terminal, the set of running [`Agent`]s, and the channels they
+//! emit on. The loop fans `AgentEvent`s and `UsageEvent`s in from background
+//! reader threads while polling crossterm for input, then dispatches each
+//! key to one of four handlers depending on focus and modal state: deck
+//! navigation, the focused agent's PTY, the add-agent modal, or the usage
+//! dashboard. Focus toggles between deck and agent via the keymap; when no
+//! mapping fires, the configured `toggle_key` is the fallback.
+//!
+//! The PTY-size invariant lives in [`agent_pane_size`] (see lines 35-54):
+//! every time the view mode or grid shape changes, each agent's parser must
+//! be resized to match the cell it will be drawn into, otherwise rendering
+//! desyncs. Pure rendering belongs in [`crate::ui`]; this module is the only
+//! place that mutates `App`.
+
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::{
@@ -108,6 +124,7 @@ struct App {
     sort_mode: ui::SortMode,
     adding: Option<AddingState>,
     renaming: Option<RenamingState>,
+    help_visible: bool,
     should_quit: bool,
     last_pane_dims: (u16, u16),
     next_rid: RuntimeId,
@@ -130,6 +147,13 @@ struct App {
 impl App {
     fn new(cfg: Config) -> Result<Self> {
         let toggle_key = keymap::parse_key(&cfg.settings.toggle_key);
+        // User-visible signal lives in ~/.local/state/agentdeck/agentdeck.log.
+        if toggle_key.is_none() && cfg.settings.toggle_key != "ctrl-space" {
+            tracing::warn!(
+                value = %cfg.settings.toggle_key,
+                "could not parse [settings].toggle_key; falling back to ctrl-space"
+            );
+        }
         let backend = CrosstermBackend::new(stdout());
         let terminal = Terminal::new(backend).context("new terminal")?;
 
@@ -178,6 +202,7 @@ impl App {
             sort_mode: ui::SortMode::Provider,
             adding: None,
             renaming: None,
+            help_visible: false,
             should_quit: false,
             last_pane_dims: (pane.cols, pane.rows),
             next_rid,
@@ -229,6 +254,7 @@ impl App {
             let view = self.view_mode;
             let grid = self.grid_dims;
             let showing_usage = self.showing_usage;
+            let help_visible = self.help_visible;
             let usage_snapshot = self.usage_state.clone();
             self.terminal.draw(|f| {
                 draw_main(
@@ -245,6 +271,7 @@ impl App {
                     &footer,
                     modal,
                     rename_modal,
+                    help_visible,
                     &tk_label,
                 )
             })?;
@@ -390,7 +417,7 @@ impl App {
                 " typing → focused agent   {tk} → deck   Ctrl-C → interrupt   [{view_chip}] "
             ),
             Focus::Deck => format!(
-                " ↑/↓ select   1-9 focus   Tab jump   Enter focus   a add   x remove   r rename   o sort   g grid   u usage   q quit   {tk} → agent   [{view_chip}] "
+                " ↑/↓ select   1-9 focus   Tab jump   Enter focus   a add   x remove   r rename   o sort   g grid   u usage   ?:help   q quit   {tk} → agent   [{view_chip}] "
             ),
         }
     }
@@ -463,6 +490,11 @@ impl App {
             }
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 self.last_user_activity = Instant::now();
+                if self.help_visible {
+                    // Any key closes the help overlay; do not forward to the PTY.
+                    self.help_visible = false;
+                    return Ok(());
+                }
                 if let Some(state) = self.adding.as_mut() {
                     let result = handle_adding_event(k, state);
                     match result {
@@ -664,6 +696,9 @@ impl App {
                 if self.showing_usage {
                     self.maybe_tick_usage_refresh();
                 }
+            }
+            Action::ToggleHelp => {
+                self.help_visible = !self.help_visible;
             }
             Action::FocusNextWaiting => {
                 let n = model.selectable.len();
@@ -928,6 +963,7 @@ fn apply_nav_action(
         | Action::CycleSort
         | Action::ToggleView
         | Action::ToggleUsage
+        | Action::ToggleHelp
         | Action::FocusNextWaiting => return false,
     }
     true
@@ -1024,6 +1060,15 @@ mod tests {
         let mut st = (0, Focus::Deck, false);
         apply(KeyCode::Up, KeyModifiers::NONE, &mut st, &model);
         assert_eq!(st.0, 1);
+    }
+
+    #[test]
+    fn unparseable_toggle_key_returns_none() {
+        // Precondition for the warn-log in App::new: parse_key must return None
+        // for obviously-bad strings. The log emission itself is not unit-testable
+        // without a tracing fixture; the user-visible signal is the log entry at
+        // ~/.local/state/agentdeck/agentdeck.log.
+        assert!(keymap::parse_key("ctrl-spacebar").is_none());
     }
 
     #[test]

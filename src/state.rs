@@ -400,6 +400,51 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_waiting_box_corner() {
+        let mut agent = mock_agent(Provider::Codex);
+        let (rows, _cols) = agent.parser.screen().size();
+        let bytes = format!("\x1b[{};1H╭─────────────╮", rows - 1);
+        agent.feed(bytes.as_bytes());
+
+        agent.last_output_at = Instant::now() - Duration::from_secs(5);
+        assert_eq!(detect(&agent), LiveState::Waiting);
+    }
+
+    #[test]
+    fn test_codex_waiting_cursor_glyph() {
+        let mut agent = mock_agent(Provider::Codex);
+        let (rows, _cols) = agent.parser.screen().size();
+        let bytes = format!("\x1b[{};1H▌ type a message", rows - 1);
+        agent.feed(bytes.as_bytes());
+
+        agent.last_output_at = Instant::now() - Duration::from_secs(5);
+        assert_eq!(detect(&agent), LiveState::Waiting);
+    }
+
+    #[test]
+    fn test_aider_waiting_prompt() {
+        let mut agent = mock_agent(Provider::Aider);
+        let (rows, _cols) = agent.parser.screen().size();
+        let bytes = format!("\x1b[{};1H> ", rows - 1);
+        agent.feed(bytes.as_bytes());
+
+        agent.last_output_at = Instant::now() - Duration::from_secs(5);
+        assert_eq!(detect(&agent), LiveState::Waiting);
+    }
+
+    #[test]
+    fn test_codex_not_waiting_when_active() {
+        let mut agent = mock_agent(Provider::Codex);
+        let (rows, _cols) = agent.parser.screen().size();
+        let bytes = format!("\x1b[{};1H╭─────────────╮", rows - 1);
+        agent.feed(bytes.as_bytes());
+
+        // No backdating: recent output should keep us in Working, even though
+        // the screen content matches the Codex input-prompt heuristic.
+        assert_eq!(detect(&agent), LiveState::Working);
+    }
+
+    #[test]
     fn test_stuck() {
         let mut agent = mock_agent(Provider::Other);
         agent.last_output_at = Instant::now() - Duration::from_secs(60);

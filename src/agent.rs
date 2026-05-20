@@ -1,3 +1,20 @@
+//! PTY-backed agent runtime.
+//!
+//! Each [`Agent`] owns a provider CLI running in its own pseudo-terminal.
+//! A dedicated reader thread owns the PTY master read half: it pumps bytes
+//! off the PTY and forwards them as [`AgentEvent::Output`] on a shared
+//! crossbeam channel back to the main loop. The `vt100::Parser` lives on
+//! the `Agent` itself and is owned and mutated exclusively by the main
+//! loop, which calls `parser.process(&bytes)` as it drains output events
+//! (see `src/app.rs`). The parser is never touched from the reader thread,
+//! so the UI layer can read it via immutable reference without locking.
+//!
+//! [`RuntimeId`] is a process-stable u64 minted by the app, distinct from
+//! the user-facing [`AgentConfig`] `id` (which is a config-file string and
+//! may be reused, renamed, or shared across config reloads). Channel keys
+//! and event routing use `RuntimeId` so events stay correct across
+//! reordering, removal, and respawn of agents.
+
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};

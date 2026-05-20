@@ -23,6 +23,8 @@ pub enum Action {
     ToggleView,
     /// Show / hide the centralized usage dashboard.
     ToggleUsage,
+    /// Show / hide the keybindings help overlay.
+    ToggleHelp,
     FocusNextWaiting,
     RenameAgent,
     None,
@@ -31,6 +33,12 @@ pub enum Action {
 pub fn map_deck_key(ev: KeyEvent, toggle_key: Option<KeyEvent>) -> Action {
     if ev.kind != KeyEventKind::Press {
         return Action::None;
+    }
+
+    // Help-overlay shortcuts win over a user-configured toggle_key. Otherwise
+    // a user who bound `toggle_key = "f1"` could never reach the help modal.
+    if matches!(ev.code, KeyCode::Char('?') | KeyCode::F(1)) {
+        return Action::ToggleHelp;
     }
 
     if let Some(tk) = toggle_key {
@@ -61,6 +69,7 @@ pub fn map_deck_key(ev: KeyEvent, toggle_key: Option<KeyEvent>) -> Action {
         KeyCode::Char('o') => Action::CycleSort,
         KeyCode::Char('g') => Action::ToggleView,
         KeyCode::Char('u') => Action::ToggleUsage,
+        KeyCode::Char('?') | KeyCode::F(1) => Action::ToggleHelp,
         KeyCode::Tab => Action::FocusNextWaiting,
 
         _ => Action::None,
@@ -342,6 +351,15 @@ mod tests {
     }
 
     #[test]
+    fn map_deck_key_question_mark_and_f1_toggle_help() {
+        assert_eq!(
+            map_deck_key(k(KeyCode::Char('?')), None),
+            Action::ToggleHelp
+        );
+        assert_eq!(map_deck_key(k(KeyCode::F(1)), None), Action::ToggleHelp);
+    }
+
+    #[test]
     fn map_deck_key_tab_focuses_next_waiting() {
         assert_eq!(
             map_deck_key(k(KeyCode::Tab), None),
@@ -371,12 +389,27 @@ mod tests {
     fn map_deck_key_custom_toggle_key_overrides_ctrl_space() {
         // With a custom toggle key configured, Ctrl-Space no longer toggles
         // and the configured key takes its place.
-        let toggle = Some(km(KeyCode::F(1), KeyModifiers::empty()));
+        let toggle = Some(km(KeyCode::F(2), KeyModifiers::empty()));
         assert_eq!(
             map_deck_key(km(KeyCode::Char(' '), KeyModifiers::CONTROL), toggle),
             Action::None,
         );
-        assert_eq!(map_deck_key(k(KeyCode::F(1)), toggle), Action::ToggleFocus,);
+        assert_eq!(map_deck_key(k(KeyCode::F(2)), toggle), Action::ToggleFocus,);
+    }
+
+    #[test]
+    fn map_deck_key_help_keys_win_over_custom_toggle_key() {
+        // F1 and ? must always open the help overlay, even if the user has
+        // bound them as their focus-toggle key — otherwise the help modal
+        // becomes unreachable.
+        let toggle = Some(km(KeyCode::F(1), KeyModifiers::empty()));
+        assert_eq!(map_deck_key(k(KeyCode::F(1)), toggle), Action::ToggleHelp);
+
+        let toggle = Some(km(KeyCode::Char('?'), KeyModifiers::empty()));
+        assert_eq!(
+            map_deck_key(k(KeyCode::Char('?')), toggle),
+            Action::ToggleHelp
+        );
     }
 
     // ---- parse_key ---------------------------------------------------------

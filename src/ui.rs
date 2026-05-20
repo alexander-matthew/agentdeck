@@ -1,3 +1,17 @@
+//! Pure rendering layer for the TUI.
+//!
+//! Every function here takes immutable references to `App` state and produces
+//! a frame — no state mutation happens in this module. Input handling and
+//! side effects live in [`crate::app`]; this file only knows how to draw.
+//!
+//! Layout is driven by the `SIDEBAR_WIDTH` constant: a fixed-width left
+//! sidebar listing agents (grouped by provider, ordered by the current sort
+//! mode and flattened into a `Row` model), and a right-hand pane that either
+//! shows a single focused agent or a grid of agents per [`ViewMode`]. Modal
+//! overlays (add-agent picker, usage dashboard) are drawn last on top of the
+//! main frame using `Clear`. Any new visual surface should follow the same
+//! "take refs, return frames" contract.
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -128,6 +142,7 @@ pub fn draw_main(
     footer: &str,
     modal: Option<AddModalState>,
     rename_modal: Option<RenameModalState>,
+    help_visible: bool,
     tk_label: &str,
 ) {
     let chunks = Layout::default()
@@ -194,6 +209,9 @@ pub fn draw_main(
     }
     if let Some(m) = rename_modal {
         render_rename_modal(f, m);
+    }
+    if help_visible {
+        render_help_modal(f, tk_label);
     }
 }
 
@@ -803,6 +821,64 @@ fn render_rename_modal(f: &mut Frame, m: RenameModalState) {
     );
 }
 
+fn render_help_modal(f: &mut Frame, tk_label: &str) {
+    let area = f.area();
+    let width = area.width.clamp(40, 78);
+    let height = 11u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " keybindings ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let label = |s: &'static str| {
+        Span::styled(
+            s,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let lines = vec![
+        Line::from(vec![
+            label("Navigation:  "),
+            Span::raw("j/k/↑/↓ move · 1–9 jump · Enter focus agent · Tab next waiting"),
+        ]),
+        Line::from(vec![
+            label("Focus:       "),
+            Span::raw(format!("{tk_label} toggle deck/agent · q or Ctrl-C quit")),
+        ]),
+        Line::from(vec![
+            label("View:        "),
+            Span::raw("g grid · u usage · o cycle sort"),
+        ]),
+        Line::from(vec![
+            label("Agents:      "),
+            Span::raw("a/+ add · x remove · r rename"),
+        ]),
+        Line::from(vec![label("Misc:        "), Span::raw("? help · F1 help")]),
+        Line::from(""),
+        Line::from(Span::styled(
+            " press any key to close ",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -856,6 +932,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
@@ -909,6 +986,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
@@ -955,6 +1033,7 @@ mod tests {
                 " footer ",
                 None,
                 None,
+                false,
                 "Ctrl-Space",
             )
         })
@@ -1139,6 +1218,7 @@ mod tests {
                     " footer ",
                     None,
                     None,
+                    false,
                     "Ctrl-Space",
                 )
             })
@@ -1158,6 +1238,124 @@ mod tests {
             agent_lines[0].contains("focus: agent"),
             "agent header: {:?}",
             agent_lines[0]
+        );
+    }
+
+    #[test]
+    fn draw_main_help_modal_lists_all_categories_with_dynamic_toggle_label() {
+        let agents = vec![
+            mock_agent(Provider::Claude, "alpha"),
+            mock_agent(Provider::Codex, "bravo"),
+            mock_agent(Provider::Gemini, "charlie"),
+        ];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let mut term = Terminal::new(TestBackend::new(100, 26)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " ?:help ",
+                None,
+                None,
+                true,
+                "ctrl-space",
+            )
+        })
+        .expect("draw");
+
+        let lines = buf_lines(&term);
+        let all = lines.join("\n");
+        for needle in [
+            "keybindings",
+            "Navigation:",
+            "Focus:",
+            "View:",
+            "Agents:",
+            "Misc:",
+            "j/k/↑/↓",
+            "g grid",
+            "a/+ add",
+            "? help",
+            "F1 help",
+            "ctrl-space toggle deck/agent",
+            "press any key to close",
+        ] {
+            assert!(all.contains(needle), "help modal missing {needle:?}");
+        }
+        assert!(
+            lines[lines.len() - 1].contains("?:help"),
+            "footer should advertise ?:help: {:?}",
+            lines[lines.len() - 1]
+        );
+    }
+
+    /// Snapshot test for the help-overlay modal.
+    ///
+    /// Compares the rendered buffer against the checked-in snapshot at
+    /// `src/snapshots/draw_main_help_modal.snap`. If the rendering changes
+    /// deliberately, regenerate the snapshot by running this test with the
+    /// env var `UPDATE_SNAPSHOTS=1` set, then commit the new `.snap`.
+    ///
+    /// We hand-roll snapshot file comparison here because `insta` is not
+    /// available (Cargo.toml is a protected path for the agent loop).
+    #[test]
+    fn draw_main_help_modal_matches_snapshot() {
+        let agents = vec![
+            mock_agent(Provider::Claude, "alpha"),
+            mock_agent(Provider::Codex, "bravo"),
+            mock_agent(Provider::Gemini, "charlie"),
+        ];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let mut term = Terminal::new(TestBackend::new(100, 26)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " ?:help ",
+                None,
+                None,
+                true,
+                "ctrl-space",
+            )
+        })
+        .expect("draw");
+
+        let actual = buf_lines(&term).join("\n") + "\n";
+
+        let snapshot_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/snapshots/draw_main_help_modal.snap",
+        );
+
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(snapshot_path, &actual).expect("write snapshot");
+            return;
+        }
+
+        let expected = include_str!("snapshots/draw_main_help_modal.snap");
+        assert_eq!(
+            actual, expected,
+            "help-modal snapshot drift; rerun with UPDATE_SNAPSHOTS=1 to refresh",
         );
     }
 }
