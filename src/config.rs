@@ -244,3 +244,177 @@ fn default_config() -> Config {
         ],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_dir(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdeck-config-test-{}-{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn settings_default_matches_documented_values() {
+        let s = Settings::default();
+        assert_eq!(s.prefix_byte, 0x01);
+        assert_eq!(s.detach_key, 'd');
+        assert_eq!(s.toggle_key, "ctrl-space");
+        assert_eq!(s.grid_rows, 2);
+        assert_eq!(s.grid_cols, 2);
+        assert_eq!(s.usage_refresh_secs, 60);
+    }
+
+    #[test]
+    fn default_config_lists_five_agents_in_order() {
+        let cfg = default_config();
+        let expected: &[(&str, Provider)] = &[
+            ("claude", Provider::Claude),
+            ("codex", Provider::Codex),
+            ("gemini", Provider::Gemini),
+            ("aider", Provider::Aider),
+            ("shell", Provider::Shell),
+        ];
+        assert_eq!(cfg.agents.len(), expected.len());
+        for (agent, (expected_id, expected_provider)) in cfg.agents.iter().zip(expected) {
+            assert_eq!(&agent.id, expected_id);
+            assert_eq!(agent.provider, *expected_provider);
+            assert!(!agent.display_name().is_empty());
+            assert!(!agent.manual);
+            assert_eq!(agent.cwd.as_deref(), Some("~"));
+        }
+        let claude_cmd = cfg
+            .usage_commands
+            .get("claude")
+            .expect("claude usage command present");
+        assert!(claude_cmd.contains("ccusage"));
+    }
+
+    #[test]
+    fn resolved_cwd_expands_tilde_and_passes_through_none() {
+        // safety: no other test in this module reads or mutates HOME, so the
+        // env-var write here cannot race with another test thread.
+        unsafe {
+            std::env::set_var("HOME", "/tmp/agentdeck-fake-home");
+        }
+        let agent = AgentConfig {
+            id: "x".into(),
+            name: None,
+            provider: Provider::Shell,
+            command: "sh".into(),
+            args: vec![],
+            cwd: Some("~".into()),
+            env: BTreeMap::new(),
+            manual: false,
+        };
+        assert_eq!(
+            agent.resolved_cwd(),
+            Some(PathBuf::from("/tmp/agentdeck-fake-home"))
+        );
+
+        let no_cwd = AgentConfig { cwd: None, ..agent };
+        assert_eq!(no_cwd.resolved_cwd(), None);
+    }
+
+    #[test]
+    fn provider_tag_round_trips_every_variant() {
+        let cases = [
+            (Provider::Claude, "claude"),
+            (Provider::Codex, "codex"),
+            (Provider::Gemini, "gemini"),
+            (Provider::Aider, "aider"),
+            (Provider::Shell, "shell"),
+            (Provider::Other, "other"),
+        ];
+        for (variant, expected_tag) in cases {
+            assert_eq!(variant.tag(), expected_tag);
+            let doc = format!("id = \"x\"\ncommand = \"c\"\nprovider = \"{expected_tag}\"\n");
+            let parsed: AgentConfig = toml::from_str(&doc).expect("parse agent with provider tag");
+            assert_eq!(parsed.provider, variant);
+        }
+    }
+
+    #[test]
+    fn load_or_init_writes_seed_on_first_run() {
+        let dir = make_dir("first-run");
+        let path = dir.join("config.toml");
+
+        let cfg = load_or_init(&path).expect("first-run load");
+        assert!(path.exists(), "config file should be written");
+        let raw = std::fs::read_to_string(&path).expect("read written config");
+        assert!(raw.contains("[settings]"), "expected [settings] block");
+        assert!(
+            raw.contains("[[agent]]"),
+            "expected at least one [[agent]] block"
+        );
+
+        // Round-trip: re-parse the file we just wrote and confirm it matches.
+        let reparsed: Config = toml::from_str(&raw).expect("re-parse written config");
+        let default = default_config();
+        let ids: Vec<&str> = cfg.agents.iter().map(|a| a.id.as_str()).collect();
+        let default_ids: Vec<&str> = default.agents.iter().map(|a| a.id.as_str()).collect();
+        let reparsed_ids: Vec<&str> = reparsed.agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, default_ids);
+        assert_eq!(reparsed_ids, default_ids);
+
+        let providers: Vec<Provider> = cfg.agents.iter().map(|a| a.provider).collect();
+        let default_providers: Vec<Provider> = default.agents.iter().map(|a| a.provider).collect();
+        let reparsed_providers: Vec<Provider> =
+            reparsed.agents.iter().map(|a| a.provider).collect();
+        assert_eq!(providers, default_providers);
+        assert_eq!(reparsed_providers, default_providers);
+
+        assert_eq!(cfg.settings.prefix_byte, default.settings.prefix_byte);
+        assert_eq!(cfg.settings.detach_key, default.settings.detach_key);
+        assert_eq!(cfg.settings.toggle_key, default.settings.toggle_key);
+        assert_eq!(cfg.settings.grid_rows, default.settings.grid_rows);
+        assert_eq!(cfg.settings.grid_cols, default.settings.grid_cols);
+        assert_eq!(
+            cfg.settings.usage_refresh_secs,
+            default.settings.usage_refresh_secs
+        );
+        assert_eq!(reparsed.settings.prefix_byte, default.settings.prefix_byte);
+        assert_eq!(reparsed.settings.toggle_key, default.settings.toggle_key);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_init_round_trips_custom_settings() {
+        let dir = make_dir("custom-grid");
+        let path = dir.join("config.toml");
+        let body = "\
+[settings]
+grid_rows = 3
+
+[[agent]]
+id = \"only\"
+provider = \"shell\"
+command = \"sh\"
+";
+        std::fs::write(&path, body).expect("seed config file");
+        let cfg = load_or_init(&path).expect("parse pre-written config");
+        assert_eq!(cfg.settings.grid_rows, 3);
+        // Unmentioned settings keep their defaults.
+        assert_eq!(cfg.settings.grid_cols, 2);
+        assert_eq!(cfg.settings.toggle_key, "ctrl-space");
+        assert_eq!(cfg.agents.len(), 1);
+        assert_eq!(cfg.agents[0].id, "only");
+        assert_eq!(cfg.agents[0].provider, Provider::Shell);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_init_returns_err_on_invalid_toml() {
+        let dir = make_dir("invalid");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is = not = valid = toml").expect("write invalid toml");
+        assert!(load_or_init(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
