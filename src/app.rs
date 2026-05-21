@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::stdout;
 use std::time::{Duration, Instant};
 
-use crate::agent::{Agent, AgentEvent, RuntimeId, Status};
+use crate::agent::{Agent, AgentEvent, RuntimeId, SpawnFailure, Status};
 use crate::config::{AgentConfig, Config, Provider};
 use crate::keymap::{self, Action};
 use crate::ui::{self, AddModalState, Focus, ViewMode, draw_main};
@@ -125,6 +125,7 @@ struct App {
     adding: Option<AddingState>,
     renaming: Option<RenamingState>,
     help_visible: bool,
+    pending_spawn_failures: Vec<SpawnFailure>,
     should_quit: bool,
     last_pane_dims: (u16, u16),
     next_rid: RuntimeId,
@@ -168,22 +169,8 @@ impl App {
         };
 
         let (agent_tx, agent_rx) = unbounded::<AgentEvent>();
-        let mut next_rid: RuntimeId = 1;
-        let mut agents: Vec<Agent> = Vec::with_capacity(cfg.agents.len());
-        for ac in cfg.agents.iter() {
-            if ac.manual {
-                tracing::info!(id = %ac.id, "skipping manual agent");
-                continue;
-            }
-            let rid = next_rid;
-            next_rid += 1;
-            match Agent::spawn(ac, rid, initial_size, agent_tx.clone()) {
-                Ok(a) => agents.push(a),
-                Err(e) => {
-                    tracing::error!(id = %ac.id, error = ?e, "failed to spawn agent");
-                }
-            }
-        }
+        let (agents, pending_spawn_failures, next_rid) =
+            spawn_configured_agents(&cfg.agents, initial_size, &agent_tx, 1);
 
         if agents.is_empty() {
             return Err(anyhow::anyhow!("no agents could be spawned"));
@@ -203,6 +190,7 @@ impl App {
             adding: None,
             renaming: None,
             help_visible: false,
+            pending_spawn_failures,
             should_quit: false,
             last_pane_dims: (pane.cols, pane.rows),
             next_rid,
@@ -256,6 +244,7 @@ impl App {
             let showing_usage = self.showing_usage;
             let help_visible = self.help_visible;
             let usage_snapshot = self.usage_state.clone();
+            let spawn_failures = &self.pending_spawn_failures;
             self.terminal.draw(|f| {
                 draw_main(
                     f,
@@ -272,6 +261,7 @@ impl App {
                     modal,
                     rename_modal,
                     help_visible,
+                    spawn_failures,
                     &tk_label,
                 )
             })?;
@@ -490,6 +480,12 @@ impl App {
             }
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 self.last_user_activity = Instant::now();
+                if !self.pending_spawn_failures.is_empty() {
+                    // Any key dismisses the startup spawn-failure modal; the
+                    // failures stay in the tracing log for post-hoc inspection.
+                    self.pending_spawn_failures.clear();
+                    return Ok(());
+                }
                 if self.help_visible {
                     // Any key closes the help overlay; do not forward to the PTY.
                     self.help_visible = false;
@@ -854,6 +850,41 @@ fn handle_adding_event(k: KeyEvent, state: &mut AddingState) -> AddingResult {
     }
 }
 
+/// Try to spawn every non-manual agent in `agent_configs`. Returns the
+/// successfully-spawned agents, a list of failures (id + provider + error
+/// string) for surfacing in the UI, and the next free `RuntimeId`. Failures
+/// also continue to be emitted via `tracing::error!` for log inspection.
+fn spawn_configured_agents(
+    agent_configs: &[AgentConfig],
+    initial_size: PtySize,
+    agent_tx: &Sender<AgentEvent>,
+    starting_rid: RuntimeId,
+) -> (Vec<Agent>, Vec<SpawnFailure>, RuntimeId) {
+    let mut next_rid = starting_rid;
+    let mut agents: Vec<Agent> = Vec::with_capacity(agent_configs.len());
+    let mut failures: Vec<SpawnFailure> = Vec::new();
+    for ac in agent_configs.iter() {
+        if ac.manual {
+            tracing::info!(id = %ac.id, "skipping manual agent");
+            continue;
+        }
+        let rid = next_rid;
+        next_rid += 1;
+        match Agent::spawn(ac, rid, initial_size, agent_tx.clone()) {
+            Ok(a) => agents.push(a),
+            Err(e) => {
+                tracing::error!(id = %ac.id, error = ?e, "failed to spawn agent");
+                failures.push(SpawnFailure {
+                    id: ac.id.clone(),
+                    provider: ac.provider,
+                    error: format!("{e:#}"),
+                });
+            }
+        }
+    }
+    (agents, failures, next_rid)
+}
+
 fn byte_index_for_char_cursor(s: &str, char_cursor: usize) -> usize {
     s.char_indices()
         .nth(char_cursor)
@@ -1069,6 +1100,48 @@ mod tests {
         // without a tracing fixture; the user-visible signal is the log entry at
         // ~/.local/state/agentdeck/agentdeck.log.
         assert!(keymap::parse_key("ctrl-spacebar").is_none());
+    }
+
+    #[test]
+    fn spawn_configured_agents_collects_failures_alongside_successes() {
+        use crate::config::AgentConfig;
+        use std::collections::BTreeMap;
+
+        let (tx, _rx) = unbounded::<AgentEvent>();
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let make = |id: &str, provider, command: &str| AgentConfig {
+            id: id.into(),
+            name: None,
+            provider,
+            command: command.into(),
+            args: vec![],
+            cwd: None,
+            env: BTreeMap::new(),
+            manual: false,
+        };
+        let configs = vec![
+            make("ok", Provider::Shell, "true"),
+            make("typo", Provider::Claude, "/nonexistent/path/claud"),
+        ];
+        let (mut spawned, failures, next_rid) = spawn_configured_agents(&configs, size, &tx, 1);
+        assert_eq!(spawned.len(), 1, "the valid `true` agent should spawn");
+        assert_eq!(failures.len(), 1, "the invalid path agent should fail");
+        assert_eq!(failures[0].id, "typo");
+        assert_eq!(failures[0].provider, Provider::Claude);
+        assert!(
+            !failures[0].error.is_empty(),
+            "failure should carry a non-empty error string"
+        );
+        // Each config consumed a rid even if the spawn failed.
+        assert_eq!(next_rid, 3);
+        for a in spawned.iter_mut() {
+            a.kill();
+        }
     }
 
     #[test]
