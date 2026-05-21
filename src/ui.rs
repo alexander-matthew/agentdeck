@@ -1361,4 +1361,142 @@ mod tests {
             "help-modal snapshot drift; rerun with UPDATE_SNAPSHOTS=1 to refresh",
         );
     }
+
+    /// Snapshot test for the add-agent modal in its "populated" state:
+    /// all six providers listed, Gemini (index 2) selected, and a long
+    /// `~/code/...` cwd with the cursor parked mid-string.
+    ///
+    /// Hand-rolled (no `insta`) because `Cargo.toml` is a protected path
+    /// for the agent loop and dependency changes are human-only. See
+    /// [`draw_main_help_modal_matches_snapshot`] for the same pattern.
+    ///
+    /// Refresh after intentional UI changes with
+    /// `UPDATE_SNAPSHOTS=1 cargo test draw_main_add_modal_populated_matches_snapshot`.
+    #[test]
+    fn draw_main_add_modal_populated_matches_snapshot() {
+        let agents = vec![mock_agent(Provider::Claude, "alpha")];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let providers = [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::Gemini,
+            Provider::Aider,
+            Provider::Shell,
+            Provider::Other,
+        ];
+        let cwd = "~/code/agentdeck-with-a-fairly-long-path";
+        let mut term = Terminal::new(TestBackend::new(120, 30)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " footer ",
+                Some(AddModalState {
+                    providers: &providers,
+                    selected_provider: 2,
+                    cwd,
+                    cursor: 10,
+                }),
+                None,
+                false,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
+
+        let actual = buf_lines(&term).join("\n") + "\n";
+
+        let snapshot_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/snapshots/draw_main_add_modal_populated.snap",
+        );
+
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(snapshot_path, &actual).expect("write snapshot");
+            return;
+        }
+
+        let expected = include_str!("snapshots/draw_main_add_modal_populated.snap");
+        assert_eq!(
+            actual, expected,
+            "add-modal populated snapshot drift; rerun with UPDATE_SNAPSHOTS=1 to refresh",
+        );
+    }
+
+    /// Snapshot test for the add-agent modal in its "empty cwd" state:
+    /// six providers listed, Claude (index 0) selected, cursor at the
+    /// start of an empty cwd field.
+    ///
+    /// Hand-rolled (no `insta`) for the same protected-`Cargo.toml`
+    /// reason as the other snapshot tests in this module. Refresh with
+    /// `UPDATE_SNAPSHOTS=1 cargo test draw_main_add_modal_empty_matches_snapshot`.
+    #[test]
+    fn draw_main_add_modal_empty_matches_snapshot() {
+        let agents = vec![mock_agent(Provider::Claude, "alpha")];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let providers = [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::Gemini,
+            Provider::Aider,
+            Provider::Shell,
+            Provider::Other,
+        ];
+        let mut term = Terminal::new(TestBackend::new(120, 30)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " footer ",
+                Some(AddModalState {
+                    providers: &providers,
+                    selected_provider: 0,
+                    cwd: "",
+                    cursor: 0,
+                }),
+                None,
+                false,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
+
+        let actual = buf_lines(&term).join("\n") + "\n";
+
+        let snapshot_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/snapshots/draw_main_add_modal_empty.snap",
+        );
+
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(snapshot_path, &actual).expect("write snapshot");
+            return;
+        }
+
+        let expected = include_str!("snapshots/draw_main_add_modal_empty.snap");
+        assert_eq!(
+            actual, expected,
+            "add-modal empty snapshot drift; rerun with UPDATE_SNAPSHOTS=1 to refresh",
+        );
+    }
 }
