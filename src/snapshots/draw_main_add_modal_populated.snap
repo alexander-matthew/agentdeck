@@ -1,0 +1,30 @@
+ agentdeck    focus: deck   [1 agents]   Ctrl-Space to toggle focus                                                     
+┌ agents ──────────────────────────┐┌ alpha · running · idle ──────────────────────────────────────────────────────────┐
+│  claude (1)                      ││                                                                                  │
+│▶  1 ● alpha              idle    ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                       ┌ add agent ───────────────────────────────────────────────────────────┐                       │
+│                       │                                                                      │                       │
+│                       │ variety:  claude   codex   gemini   aider   shell   other            │                       │
+│                       │                                                                      │                       │
+│                       │ Working directory for the new agent:                                 │                       │
+│                       │ cwd: ~/code/age│ntdeck-with-a-fairly-long-path                       │                       │
+│                       │                                                                      │                       │
+│                       │ ←/→: variety   Tab: switch field   Enter: spawn   Esc: cancel        │                       │
+│                       │                                                                      │                       │
+│                       │                                                                      │                       │
+│                       └──────────────────────────────────────────────────────────────────────┘                       │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+│                                  ││                                                                                  │
+└──────────────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────┘
+ footer                                                                                                                 
