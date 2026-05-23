@@ -63,6 +63,17 @@ pub enum Status {
     SpawnFailed,
 }
 
+/// A configured agent that failed to spawn at startup. Surfaced to the user
+/// via a one-shot modal so a typo'd `command =` in config.toml doesn't
+/// silently drop the agent — the underlying error otherwise only reaches
+/// the tracing log at `~/.local/state/agentdeck/agentdeck.log`.
+#[derive(Debug, Clone)]
+pub struct SpawnFailure {
+    pub id: String,
+    pub provider: Provider,
+    pub error: String,
+}
+
 impl Status {
     pub fn label(&self) -> String {
         match self {

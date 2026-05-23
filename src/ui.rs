@@ -20,7 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::agent::{Agent, Status};
+use crate::agent::{Agent, SpawnFailure, Status};
 use crate::config::Provider;
 use crate::state::{self, LiveState};
 use crate::usage::UsageState;
@@ -143,6 +143,7 @@ pub fn draw_main(
     modal: Option<AddModalState>,
     rename_modal: Option<RenameModalState>,
     help_visible: bool,
+    spawn_failures: &[SpawnFailure],
     tk_label: &str,
 ) {
     let chunks = Layout::default()
@@ -212,6 +213,9 @@ pub fn draw_main(
     }
     if help_visible {
         render_help_modal(f, tk_label);
+    }
+    if !spawn_failures.is_empty() {
+        render_spawn_failures_modal(f, spawn_failures);
     }
 }
 
@@ -879,6 +883,65 @@ fn render_help_modal(f: &mut Frame, tk_label: &str) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// One-shot modal listing agents that failed to spawn at startup. Modeled on
+/// [`render_help_modal`]: dismissed by any key press in the main event loop.
+fn render_spawn_failures_modal(f: &mut Frame, failures: &[SpawnFailure]) {
+    let area = f.area();
+    let width = area.width.clamp(50, 80);
+    // 2 borders + per-failure line + blank + dismiss hint.
+    let content_height = failures.len() as u16 + 2;
+    let height = (content_height + 2).min(area.height.max(4));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, rect);
+    let n = failures.len();
+    let title = format!(
+        " failed to spawn {n} agent{} ",
+        if n == 1 { "" } else { "s" }
+    );
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        title,
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(failures.len() + 2);
+    // Reserve room for the " <tag> id: " prefix when sizing the error text.
+    let prefix_budget = 4 + 16; // tag chip + id + ": "
+    let err_budget = (inner.width as usize).saturating_sub(prefix_budget).max(20);
+    for fail in failures {
+        let err_trunc = truncate(&fail.error, err_budget);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", fail.provider.tag()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                fail.id.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(": "),
+            Span::styled(err_trunc, Style::default().fg(Color::Red)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " press any key to dismiss ",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -933,6 +996,7 @@ mod tests {
                 None,
                 None,
                 false,
+                &[],
                 "Ctrl-Space",
             )
         })
@@ -987,6 +1051,7 @@ mod tests {
                 None,
                 None,
                 false,
+                &[],
                 "Ctrl-Space",
             )
         })
@@ -1034,6 +1099,7 @@ mod tests {
                 None,
                 None,
                 false,
+                &[],
                 "Ctrl-Space",
             )
         })
@@ -1078,6 +1144,7 @@ mod tests {
                 None,
                 None,
                 false,
+                &[],
                 "Ctrl-Space",
             )
         })
@@ -1118,6 +1185,7 @@ mod tests {
                 None,
                 None,
                 false,
+                &[],
                 "Ctrl-Space",
             )
         })
@@ -1173,6 +1241,7 @@ mod tests {
                 None,
                 None,
                 false,
+                &[],
                 "Ctrl-Space",
             )
         })
@@ -1222,6 +1291,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    &[],
                     "Ctrl-Space",
                 )
             })
@@ -1271,6 +1341,7 @@ mod tests {
                 None,
                 None,
                 true,
+                &[],
                 "ctrl-space",
             )
         })
@@ -1338,6 +1409,7 @@ mod tests {
                 None,
                 None,
                 true,
+                &[],
                 "ctrl-space",
             )
         })
@@ -1409,6 +1481,7 @@ mod tests {
                 }),
                 None,
                 false,
+                &[],
                 "Ctrl-Space",
             )
         })
@@ -1476,6 +1549,7 @@ mod tests {
                 }),
                 None,
                 false,
+                &[],
                 "Ctrl-Space",
             )
         })
@@ -1498,5 +1572,59 @@ mod tests {
             actual, expected,
             "add-modal empty snapshot drift; rerun with UPDATE_SNAPSHOTS=1 to refresh",
         );
+    }
+
+    #[test]
+    fn draw_main_spawn_failures_modal_lists_each_failure_with_dismiss_hint() {
+        let agents = vec![mock_agent(Provider::Shell, "alpha")];
+        let model = build_rows(&agents, SortMode::Provider);
+        let visible: Vec<usize> = (0..agents.len()).collect();
+        let usage = UsageState::default();
+        let failures = vec![
+            SpawnFailure {
+                id: "claude".into(),
+                provider: Provider::Claude,
+                error: "No such file or directory (os error 2)".into(),
+            },
+            SpawnFailure {
+                id: "gemini".into(),
+                provider: Provider::Gemini,
+                error: "permission denied".into(),
+            },
+        ];
+        let mut term = Terminal::new(TestBackend::new(100, 20)).expect("backend");
+        term.draw(|f| {
+            draw_main(
+                f,
+                &agents,
+                &model,
+                0,
+                Focus::Deck,
+                ViewMode::Single,
+                (1, 1),
+                &visible,
+                false,
+                &usage,
+                " footer ",
+                None,
+                None,
+                false,
+                &failures,
+                "Ctrl-Space",
+            )
+        })
+        .expect("draw");
+
+        let all = buf_lines(&term).join("\n");
+        for needle in [
+            "failed to spawn 2 agents",
+            "claude",
+            "gemini",
+            "No such file or directory",
+            "permission denied",
+            "press any key to dismiss",
+        ] {
+            assert!(all.contains(needle), "modal missing {needle:?}: {all}");
+        }
     }
 }
