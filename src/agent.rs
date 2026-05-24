@@ -100,6 +100,14 @@ impl Agent {
         size: PtySize,
         tx: Sender<AgentEvent>,
     ) -> Result<Self> {
+        let span = tracing::info_span!(
+            "agent.spawn",
+            id = %cfg.id,
+            provider = cfg.provider.tag(),
+            rid,
+        );
+        let _enter = span.enter();
+
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size).context("openpty for new agent")?;
 
@@ -119,10 +127,17 @@ impl Agent {
             std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
         );
 
+        tracing::info!(
+            command = %cfg.command,
+            args = ?cfg.args,
+            cwd = ?cfg.resolved_cwd(),
+            "spawning",
+        );
         let child = pair
             .slave
             .spawn_command(cmd)
             .with_context(|| format!("spawn `{}`", cfg.command))?;
+        tracing::info!(pid = ?child.process_id(), "spawned");
         drop(pair.slave); // we don't need the slave fd in this process anymore
 
         let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
@@ -136,6 +151,7 @@ impl Agent {
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
+                            tracing::warn!(rid, "reader closed unexpectedly");
                             let _ = tx.send(AgentEvent::ReaderClosed { rid });
                             break;
                         }
@@ -151,6 +167,7 @@ impl Agent {
                             }
                         }
                         Err(_) => {
+                            tracing::warn!(rid, "reader closed unexpectedly");
                             let _ = tx.send(AgentEvent::ReaderClosed { rid });
                             break;
                         }
@@ -206,6 +223,7 @@ impl Agent {
             pixel_height: 0,
         };
         if self.master.resize(size).is_ok() {
+            tracing::debug!(rid = self.rid, rows, cols, "resize");
             self.size = size;
             self.parser.set_size(rows, cols);
         }
@@ -216,11 +234,13 @@ impl Agent {
             && let Ok(Some(status)) = self.child.try_wait()
         {
             let code = status.exit_code() as i32;
+            tracing::info!(rid = self.rid, exit_code = code, "agent exited");
             self.status = Status::Exited(code);
         }
     }
 
     pub fn kill(&mut self) {
+        tracing::info!(rid = self.rid, "agent killed");
         let _ = self.child.kill();
     }
 
