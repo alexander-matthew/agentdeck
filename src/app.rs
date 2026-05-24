@@ -562,7 +562,7 @@ impl App {
                         self.focus = Focus::Deck;
                     } else {
                         if let Some(agent) = self.current_agent_mut(model) {
-                            agent.scroll_offset = 0;
+                            agent.scroll_to_bottom();
                         }
                         self.forward_to_agent(k, model);
                     }
@@ -1018,8 +1018,8 @@ fn apply_scroll_action(agent: &mut Agent, action: Action, pane_rows: u16) -> boo
     match action {
         Action::ScrollUp => agent.scroll_up(page),
         Action::ScrollDown => agent.scroll_down(page),
-        Action::ScrollTop => agent.scroll_offset = crate::agent::MAX_SCROLLBACK,
-        Action::ScrollBottom => agent.scroll_offset = 0,
+        Action::ScrollTop => agent.scroll_to_top(),
+        Action::ScrollBottom => agent.scroll_to_bottom(),
         _ => return false,
     }
     true
@@ -1169,11 +1169,26 @@ mod tests {
         }
     }
 
+    /// Feed enough output into the agent's vt100 parser to produce exactly
+    /// `n` rows of real scrollback. The mock agent has a 24-row grid, so the
+    /// first 23 newlines just move the cursor (cursor starts at row 0); each
+    /// subsequent newline scrolls one row off the top into scrollback.
+    fn push_scrollback_lines(agent: &mut Agent, n: usize) {
+        let payload: Vec<u8> = std::iter::repeat_n(b"x\r\n".as_slice(), 23 + n)
+            .flatten()
+            .copied()
+            .collect();
+        agent.parser.process(&payload);
+    }
+
     #[test]
     fn apply_scroll_action_drives_mock_agent_through_each_variant() {
-        use crate::agent::{MAX_SCROLLBACK, test_helpers::mock_agent};
+        use crate::agent::test_helpers::mock_agent;
 
         let mut agent = mock_agent(Provider::Claude, "alpha");
+        // Give the agent 200 rows of actual scrollback — well above the
+        // page size used below but well under MAX_SCROLLBACK.
+        push_scrollback_lines(&mut agent, 200);
         assert_eq!(agent.scroll_offset, 0);
 
         // PgUp from live should jump by (pane_rows - 2).
@@ -1194,9 +1209,9 @@ mod tests {
 
         // Home jumps to the scrollback ceiling; subsequent PgUp is a no-op.
         apply_scroll_action(&mut agent, Action::ScrollTop, 20);
-        assert_eq!(agent.scroll_offset, MAX_SCROLLBACK);
+        assert_eq!(agent.scroll_offset, 200);
         apply_scroll_action(&mut agent, Action::ScrollUp, 20);
-        assert_eq!(agent.scroll_offset, MAX_SCROLLBACK);
+        assert_eq!(agent.scroll_offset, 200);
 
         // End snaps back to live.
         apply_scroll_action(&mut agent, Action::ScrollBottom, 20);
@@ -1214,6 +1229,37 @@ mod tests {
         let before = agent.scroll_offset;
         assert!(!apply_scroll_action(&mut agent, Action::Quit, 20));
         assert_eq!(agent.scroll_offset, before);
+    }
+
+    /// Regression for issue #32: PgUp and Home must clamp `scroll_offset`
+    /// to the agent's *actual* scrollback rows, not the MAX_SCROLLBACK
+    /// constant. Otherwise the pane title displays nonsense like
+    /// "[scrolled 1000/40]" when the real scrollback is only 40 rows.
+    #[test]
+    fn scroll_offset_clamps_to_actual_scrollback_not_max_constant() {
+        use crate::agent::test_helpers::mock_agent;
+
+        let mut agent = mock_agent(Provider::Claude, "alpha");
+        // Only 40 rows of real scrollback — far below MAX_SCROLLBACK (1000).
+        push_scrollback_lines(&mut agent, 40);
+
+        // Home must park at the actual scrollback ceiling, not 1000.
+        apply_scroll_action(&mut agent, Action::ScrollTop, 20);
+        assert_eq!(agent.scroll_offset, 40);
+
+        // Repeated PgUp also stops at 40, even when each page would overshoot.
+        agent.scroll_to_bottom();
+        for _ in 0..10 {
+            apply_scroll_action(&mut agent, Action::ScrollUp, 20);
+        }
+        assert_eq!(agent.scroll_offset, 40);
+
+        // Empty scrollback: PgUp/Home are both no-ops.
+        let mut empty = mock_agent(Provider::Claude, "beta");
+        apply_scroll_action(&mut empty, Action::ScrollUp, 20);
+        assert_eq!(empty.scroll_offset, 0);
+        apply_scroll_action(&mut empty, Action::ScrollTop, 20);
+        assert_eq!(empty.scroll_offset, 0);
     }
 
     #[test]
