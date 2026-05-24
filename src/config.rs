@@ -119,6 +119,63 @@ impl Provider {
     }
 }
 
+impl Config {
+    /// Pure check for foot-guns that parse fine but produce confusing
+    /// runtime behavior. Returns a list of human-readable warning strings;
+    /// an empty Vec means the config is clean. Does no I/O.
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+        for agent in &self.agents {
+            *seen.entry(agent.id.as_str()).or_insert(0) += 1;
+        }
+        for (id, count) in &seen {
+            if *count > 1 {
+                warnings.push(format!(
+                    "duplicate agent id {id:?} appears {count} times; logs and the sidebar cannot distinguish these entries"
+                ));
+            }
+        }
+
+        if self.settings.grid_rows == 0 {
+            warnings.push(
+                "settings.grid_rows = 0; clamped to 1 (set grid_rows >= 1 to silence this)".into(),
+            );
+        }
+        if self.settings.grid_cols == 0 {
+            warnings.push(
+                "settings.grid_cols = 0; clamped to 1 (set grid_cols >= 1 to silence this)".into(),
+            );
+        }
+
+        if self.settings.usage_refresh_secs < 5 {
+            warnings.push(format!(
+                "settings.usage_refresh_secs = {} is below the 5s minimum; clamped to 5",
+                self.settings.usage_refresh_secs
+            ));
+        }
+
+        let known_tags = [
+            Provider::Claude.tag(),
+            Provider::Codex.tag(),
+            Provider::Gemini.tag(),
+            Provider::Aider.tag(),
+            Provider::Shell.tag(),
+            Provider::Other.tag(),
+        ];
+        for key in self.usage_commands.keys() {
+            if !known_tags.contains(&key.as_str()) {
+                warnings.push(format!(
+                    "usage_commands key {key:?} does not match any known provider tag; entry will be ignored"
+                ));
+            }
+        }
+
+        warnings
+    }
+}
+
 impl AgentConfig {
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
@@ -407,6 +464,95 @@ command = \"sh\"
         assert_eq!(cfg.agents[0].id, "only");
         assert_eq!(cfg.agents[0].provider, Provider::Shell);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn agent(id: &str) -> AgentConfig {
+        AgentConfig {
+            id: id.into(),
+            name: None,
+            provider: Provider::Shell,
+            command: "sh".into(),
+            args: vec![],
+            cwd: None,
+            env: BTreeMap::new(),
+            manual: false,
+        }
+    }
+
+    #[test]
+    fn validate_clean_config_returns_no_warnings() {
+        let cfg = Config {
+            settings: Settings::default(),
+            agents: vec![agent("a"), agent("b")],
+            usage_commands: BTreeMap::new(),
+        };
+        assert!(cfg.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_default_config_is_clean() {
+        assert!(default_config().validate().is_empty());
+    }
+
+    #[test]
+    fn validate_flags_duplicate_agent_ids() {
+        let cfg = Config {
+            settings: Settings::default(),
+            agents: vec![agent("dup"), agent("dup"), agent("solo")],
+            usage_commands: BTreeMap::new(),
+        };
+        let warnings = cfg.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("duplicate agent id"));
+        assert!(warnings[0].contains("\"dup\""));
+        assert!(warnings[0].contains("2 times"));
+    }
+
+    #[test]
+    fn validate_flags_zero_grid_dims() {
+        let cfg = Config {
+            settings: Settings {
+                grid_rows: 0,
+                grid_cols: 0,
+                ..Settings::default()
+            },
+            agents: vec![],
+            usage_commands: BTreeMap::new(),
+        };
+        let warnings = cfg.validate();
+        assert!(warnings.iter().any(|w| w.contains("grid_rows = 0")));
+        assert!(warnings.iter().any(|w| w.contains("grid_cols = 0")));
+    }
+
+    #[test]
+    fn validate_flags_sub_five_second_usage_refresh() {
+        let cfg = Config {
+            settings: Settings {
+                usage_refresh_secs: 1,
+                ..Settings::default()
+            },
+            agents: vec![],
+            usage_commands: BTreeMap::new(),
+        };
+        let warnings = cfg.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("usage_refresh_secs = 1"));
+        assert!(warnings[0].contains("clamped to 5"));
+    }
+
+    #[test]
+    fn validate_flags_unknown_usage_commands_key() {
+        let mut usage_commands = BTreeMap::new();
+        usage_commands.insert("claude".into(), "ccusage".into());
+        usage_commands.insert("bogus".into(), "echo".into());
+        let cfg = Config {
+            settings: Settings::default(),
+            agents: vec![],
+            usage_commands,
+        };
+        let warnings = cfg.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("\"bogus\""));
     }
 
     #[test]

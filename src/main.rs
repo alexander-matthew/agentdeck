@@ -52,6 +52,11 @@ fn main() -> Result<()> {
     let cfg = config::load_or_init(&cfg_path)?;
     tracing::info!(path = %cfg_path.display(), n_agents = cfg.agents.len(), "loaded config");
 
+    for warning in cfg.validate() {
+        tracing::warn!(target: "agentdeck::config", "{warning}");
+        eprintln!("agentdeck: config warning: {warning}");
+    }
+
     app::run(cfg)
 }
 
