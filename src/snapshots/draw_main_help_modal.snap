@@ -10,13 +10,13 @@
 │          │Focus:       ctrl-space toggle deck/agent · q or Ctrl-C quit                │          │
 │          │View:        g grid · u usage · o cycle sort                                │          │
 │          │Agents:      a/+ add · x remove · r rename                                  │          │
+│          │Scroll:      PgUp/PgDn page · Home top · End jump to live                   │          │
 │          │Misc:        ? help · F1 help                                               │          │
 │          │                                                                            │          │
 │          │ press any key to close                                                     │          │
 │          │                                                                            │          │
 │          │                                                                            │          │
 │          └────────────────────────────────────────────────────────────────────────────┘          │
-│                                  ││                                                              │
 │                                  ││                                                              │
 │                                  ││                                                              │
 │                                  ││                                                              │

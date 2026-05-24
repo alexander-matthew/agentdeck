@@ -27,6 +27,11 @@ use crate::config::{AgentConfig, Provider};
 /// config `id`. Used as the channel key so events survive agent reordering/removal.
 pub type RuntimeId = u64;
 
+/// Upper bound on `Agent::scroll_offset`. Matches the vt100 scrollback row
+/// budget passed to `Parser::new`. Render-side clamping in `ui.rs` further
+/// limits this to the per-agent live scrollback height.
+pub const MAX_SCROLLBACK: u16 = 1000;
+
 /// One running provider CLI inside its own PTY.
 pub struct Agent {
     /// Stable runtime id minted by the app — unique for the lifetime of the process.
@@ -224,12 +229,32 @@ impl Agent {
         let _ = self.child.kill();
     }
 
+    /// Apply `target` as the new scrollback offset on the underlying vt100
+    /// parser, then snap `scroll_offset` to whatever vt100 actually accepted.
+    /// `Parser::set_scrollback` clamps to the buffer's real row count, so this
+    /// keeps `scroll_offset` honest — PgUp / Home can never park past the
+    /// last row of real history.
+    fn set_scroll(&mut self, target: usize) {
+        self.parser.set_scrollback(target);
+        self.scroll_offset = u16::try_from(self.parser.screen().scrollback()).unwrap_or(u16::MAX);
+    }
+
     pub fn scroll_up(&mut self, n: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_add(n).min(1000);
+        self.set_scroll((self.scroll_offset as usize).saturating_add(n as usize));
     }
 
     pub fn scroll_down(&mut self, n: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+        self.set_scroll((self.scroll_offset as usize).saturating_sub(n as usize));
+    }
+
+    /// Jump the offset to the oldest available scrollback row.
+    pub fn scroll_to_top(&mut self) {
+        self.set_scroll(MAX_SCROLLBACK as usize);
+    }
+
+    /// Snap back to the live screen.
+    pub fn scroll_to_bottom(&mut self) {
+        self.set_scroll(0);
     }
 }
 

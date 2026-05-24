@@ -27,6 +27,14 @@ pub enum Action {
     ToggleHelp,
     FocusNextWaiting,
     RenameAgent,
+    /// Scroll the focused agent's pane up by one page (PgUp).
+    ScrollUp,
+    /// Scroll the focused agent's pane down by one page (PgDn).
+    ScrollDown,
+    /// Jump to the top of the focused agent's scrollback (Home).
+    ScrollTop,
+    /// Snap back to live output (End).
+    ScrollBottom,
     None,
 }
 
@@ -71,6 +79,11 @@ pub fn map_deck_key(ev: KeyEvent, toggle_key: Option<KeyEvent>) -> Action {
         KeyCode::Char('u') => Action::ToggleUsage,
         KeyCode::Char('?') | KeyCode::F(1) => Action::ToggleHelp,
         KeyCode::Tab => Action::FocusNextWaiting,
+
+        KeyCode::PageUp => Action::ScrollUp,
+        KeyCode::PageDown => Action::ScrollDown,
+        KeyCode::Home => Action::ScrollTop,
+        KeyCode::End => Action::ScrollBottom,
 
         _ => Action::None,
     }
@@ -357,6 +370,18 @@ mod tests {
             Action::ToggleHelp
         );
         assert_eq!(map_deck_key(k(KeyCode::F(1)), None), Action::ToggleHelp);
+    }
+
+    #[test]
+    fn map_deck_key_page_up_and_page_down_scroll() {
+        assert_eq!(map_deck_key(k(KeyCode::PageUp), None), Action::ScrollUp);
+        assert_eq!(map_deck_key(k(KeyCode::PageDown), None), Action::ScrollDown);
+    }
+
+    #[test]
+    fn map_deck_key_home_and_end_jump_scrollback() {
+        assert_eq!(map_deck_key(k(KeyCode::Home), None), Action::ScrollTop);
+        assert_eq!(map_deck_key(k(KeyCode::End), None), Action::ScrollBottom);
     }
 
     #[test]
