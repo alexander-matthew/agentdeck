@@ -27,6 +27,11 @@ use crate::config::{AgentConfig, Provider};
 /// config `id`. Used as the channel key so events survive agent reordering/removal.
 pub type RuntimeId = u64;
 
+/// Upper bound on `Agent::scroll_offset`. Matches the vt100 scrollback row
+/// budget passed to `Parser::new`. Render-side clamping in `ui.rs` further
+/// limits this to the per-agent live scrollback height.
+pub const MAX_SCROLLBACK: u16 = 1000;
+
 /// One running provider CLI inside its own PTY.
 pub struct Agent {
     /// Stable runtime id minted by the app — unique for the lifetime of the process.
@@ -225,7 +230,7 @@ impl Agent {
     }
 
     pub fn scroll_up(&mut self, n: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_add(n).min(1000);
+        self.scroll_offset = self.scroll_offset.saturating_add(n).min(MAX_SCROLLBACK);
     }
 
     pub fn scroll_down(&mut self, n: u16) {

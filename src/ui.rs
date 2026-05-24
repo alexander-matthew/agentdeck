@@ -828,7 +828,7 @@ fn render_rename_modal(f: &mut Frame, m: RenameModalState) {
 fn render_help_modal(f: &mut Frame, tk_label: &str) {
     let area = f.area();
     let width = area.width.clamp(40, 78);
-    let height = 11u16;
+    let height = 12u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let rect = Rect {
@@ -872,6 +872,10 @@ fn render_help_modal(f: &mut Frame, tk_label: &str) {
         Line::from(vec![
             label("Agents:      "),
             Span::raw("a/+ add · x remove · r rename"),
+        ]),
+        Line::from(vec![
+            label("Scroll:      "),
+            Span::raw("PgUp/PgDn page · Home top · End jump to live"),
         ]),
         Line::from(vec![label("Misc:        "), Span::raw("? help · F1 help")]),
         Line::from(""),
@@ -1355,10 +1359,13 @@ mod tests {
             "Focus:",
             "View:",
             "Agents:",
+            "Scroll:",
             "Misc:",
             "j/k/↑/↓",
             "g grid",
             "a/+ add",
+            "PgUp/PgDn page",
+            "End jump to live",
             "? help",
             "F1 help",
             "ctrl-space toggle deck/agent",
