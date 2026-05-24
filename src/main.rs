@@ -34,10 +34,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     install_tracing()?;
 
-    let cfg_path = match cli.config {
-        Some(p) => p,
-        None => config::default_config_path()?,
-    };
+    let cfg_path = resolve_config_path(cli.config, std::env::var("AGENTDECK_CONFIG").ok())?;
 
     if cli.print_config {
         let resolved = config::load_or_init(&cfg_path)?;
@@ -58,6 +55,35 @@ fn main() -> Result<()> {
     }
 
     app::run(cfg)
+}
+
+/// Pure precedence: `--config` flag, then a non-empty `AGENTDECK_CONFIG`, else
+/// none (caller falls back to [`config::default_config_path`]).
+fn pick_config_source(
+    cli_override: Option<PathBuf>,
+    env_value: Option<String>,
+) -> Option<(PathBuf, &'static str)> {
+    if let Some(p) = cli_override {
+        return Some((p, "cli"));
+    }
+    if let Some(v) = env_value
+        && !v.is_empty()
+    {
+        return Some((PathBuf::from(v), "env"));
+    }
+    None
+}
+
+fn resolve_config_path(
+    cli_override: Option<PathBuf>,
+    env_value: Option<String>,
+) -> Result<PathBuf> {
+    let (path, source) = match pick_config_source(cli_override, env_value) {
+        Some(picked) => picked,
+        None => (config::default_config_path()?, "default"),
+    };
+    tracing::info!(source, path = %path.display(), "config path from CLI/env/default");
+    Ok(path)
 }
 
 fn install_tracing() -> Result<()> {
@@ -82,4 +108,30 @@ fn dirs_state_home() -> Result<PathBuf> {
     }
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home).join(".local").join("state"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_flag_wins_over_env() {
+        let picked = pick_config_source(
+            Some(PathBuf::from("/tmp/y.toml")),
+            Some("/tmp/x.toml".into()),
+        );
+        assert_eq!(picked, Some((PathBuf::from("/tmp/y.toml"), "cli")));
+    }
+
+    #[test]
+    fn env_used_when_no_cli_flag() {
+        let picked = pick_config_source(None, Some("/tmp/x.toml".into()));
+        assert_eq!(picked, Some((PathBuf::from("/tmp/x.toml"), "env")));
+    }
+
+    #[test]
+    fn empty_env_falls_back_to_default() {
+        assert_eq!(pick_config_source(None, Some(String::new())), None);
+        assert_eq!(pick_config_source(None, None), None);
+    }
 }

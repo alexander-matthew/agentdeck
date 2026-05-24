@@ -1,14 +1,17 @@
 # Configuration reference
 
-agentdeck reads a single TOML file. By default:
+## Discovery
 
-```
-$XDG_CONFIG_HOME/agentdeck/config.toml
-# or, if XDG_CONFIG_HOME is unset:
-~/.config/agentdeck/config.toml
-```
+agentdeck resolves the config file path in this order, highest priority first:
 
-Override with `agentdeck --config <path>`.
+1. `--config <FILE>` on the command line.
+2. `AGENTDECK_CONFIG` environment variable, if set and non-empty.
+3. `$XDG_CONFIG_HOME/agentdeck/config.toml`, if `XDG_CONFIG_HOME` is set and non-empty.
+4. `~/.config/agentdeck/config.toml` (the default).
+
+An empty `AGENTDECK_CONFIG=""` is treated as unset and falls through to the
+default. The chosen source (`cli` / `env` / `default`) is logged at INFO so you
+can tell at a glance how the path was picked.
 
 If the file doesn't exist on first run, agentdeck writes a default with profiles for `claude`, `codex`, `gemini`, `aider`, and `shell`, plus a starter `[usage_commands]` entry for Claude. To see the current resolved config without launching the TUI:
 
@@ -176,7 +179,8 @@ manual   = true
 
 | Var | Effect |
 | --- | --- |
-| `XDG_CONFIG_HOME` | Where to look for `agentdeck/config.toml`. |
+| `AGENTDECK_CONFIG` | Path to the config file, used when `--config` isn't passed. Wins over the `XDG_CONFIG_HOME` / `~/.config` defaults. Empty string is treated as unset. |
+| `XDG_CONFIG_HOME` | Where to look for `agentdeck/config.toml` when no higher-priority source is set. |
 | `XDG_STATE_HOME` | Where to write `agentdeck/agentdeck.log`. |
 | `AGENTDECK_LOG` | Log level filter, in [`tracing-subscriber`](https://docs.rs/tracing-subscriber/) `EnvFilter` syntax. e.g. `info`, `debug`, `agentdeck=trace,portable_pty=warn`. |
 | `HOME` | Used to derive defaults for the two `XDG_*` vars when unset. |
